@@ -93,6 +93,483 @@ module Addressable
     end
 
     ##
+    # This class represents the result of a strict reverse template match.
+    # Unlike {Addressable::Template::MatchData}, it retains every candidate
+    # that can be expanded back to the original URI.
+    class StrictMatchData
+      # Creates a new StrictMatchData object.
+      # StrictMatchData objects should never be instantiated directly.
+      #
+      # @param [Addressable::URI] uri The URI that was matched.
+      # @param [Addressable::Template] template The template used for matching.
+      # @param [Hash] types The variable types used for matching.
+      # @param [Array<Hash>] candidates The valid candidate mappings.
+      # @param [Boolean] incomplete Whether prefix truncation left unknown data.
+      # @param [Boolean] truncated Whether candidate enumeration was truncated.
+      # @param [Integer] limit The maximum number of candidates to retain.
+      def initialize(uri, template, types, candidates, incomplete, truncated,
+                     limit)
+        @uri = uri.dup.freeze
+        @template = template
+        @types = types.dup.freeze
+        @candidates = candidates.map { |candidate| candidate.dup.freeze }.freeze
+        @incomplete = incomplete
+        @truncated = truncated
+        @limit = limit
+      end
+
+      # @return [Addressable::URI] The URI that was matched.
+      attr_reader :uri
+
+      # @return [Addressable::Template] The template used for matching.
+      attr_reader :template
+
+      # @return [Hash] The variable types used for matching.
+      attr_reader :types
+
+      # @return [Array<Hash>] All retained mappings that re-expand to the URI.
+      attr_reader :candidates
+
+      # @return [Integer] The maximum number of candidates to retain.
+      attr_reader :limit
+
+      # @return [Symbol] One of +:unique+, +:multiple+, +:no_match+,
+      #   +:truncated+, or +:incomplete+.
+      def status
+        if candidates.empty? && !incomplete?
+          :no_match
+        elsif truncated?
+          :truncated
+        elsif incomplete?
+          :incomplete
+        elsif candidates.length == 1
+          :unique
+        else
+          :multiple
+        end
+      end
+
+      # @return [Boolean] Whether at least one candidate was found.
+      def match?
+        !candidates.empty?
+      end
+
+      # @return [Boolean] Whether there is exactly one complete candidate.
+      def unique?
+        status == :unique
+      end
+
+      # @return [Boolean] Whether there is more than one complete candidate.
+      def multiple?
+        status == :multiple
+      end
+
+      # @return [Boolean] Whether no candidate was found.
+      def no_match?
+        status == :no_match
+      end
+
+      # @return [Boolean] Whether the candidate limit was reached.
+      def truncated?
+        @truncated
+      end
+
+      # @return [Boolean] Whether a prefix modifier leaves unknown suffix data.
+      def incomplete?
+        @incomplete
+      end
+
+      # @return [Hash, nil] The unique candidate, or nil when not unique.
+      def mapping
+        candidates.first if unique?
+      end
+      alias_method :to_h, :mapping
+
+      # @return [String] A representation of the result.
+      def inspect
+        sprintf(
+          "#<%s:%#0x STATUS:%s CANDIDATES:%d%s>",
+          self.class.to_s, self.object_id, self.status.inspect,
+          candidates.length,
+          truncated? ? " TRUNCATED" : ""
+        )
+      end
+    end
+
+    def strict_each_nonform_list(raw, operator, variable, prior, context,
+                                 consume_all=false)
+      separator = JOINERS.fetch(operator, ",")
+      start = 0
+      if prior
+        return unless raw.start_with?(separator)
+        start = separator.length
+      end
+      remaining = raw[start..-1] || ""
+      item_separator = variable["explode"] ? separator : ","
+      positions = strict_split_positions(remaining, item_separator, operator,
+                                         variable["explode"])
+      strict_enumerate_partitions(remaining, positions, context, consume_all) do |groups, consumed|
+        if groups.empty?
+          yield [], "", nil
+        else
+          values = groups.map do |group|
+            strict_decode_scalar(group, operator)
+          end
+          unless values.any?(&:nil?)
+            yield values, raw[(start + consumed)..-1] || "", nil
+          end
+        end
+      end
+    end
+
+    def strict_each_nonform_map(raw, operator, variable, prior, context,
+                                consume_all=false)
+      separator = JOINERS.fetch(operator, ",")
+      start = 0
+      if prior
+        return unless raw.start_with?(separator)
+        start = separator.length
+      end
+      remaining = raw[start..-1] || ""
+      field_separator = variable["explode"] ? separator : ","
+      positions = strict_split_positions(remaining, field_separator, operator,
+                                         true)
+      strict_enumerate_partitions(remaining, positions, context, consume_all) do |fields, consumed, chosen|
+        if variable["explode"]
+          next unless fields.length >= 1
+          pairs = strict_decode_map_fields(fields, operator, true)
+        else
+          next unless fields.length >= 2 && fields.length.even?
+          if field_separator == "," && %w(+ #).include?(operator)
+            next unless chosen.sort == positions.select { |position|
+              position < consumed
+            }.sort
+          end
+          pairs = strict_decode_map_fields(fields, operator, false)
+        end
+        if pairs
+          value = {}
+          pairs.each { |key, val| value[key] = val }
+          if value.length == pairs.length
+            yield value, raw[(start + consumed)..-1] || "", nil
+          end
+        end
+      end
+    end
+
+    def strict_split_positions(string, separator, operator, explode)
+      string.each_char.with_index.select do |char, _|
+        char == separator
+      end.map { |_, index| index }
+    end
+
+    def strict_enumerate_partitions(string, separator_positions, context,
+                                   consume_all=false)
+      catch(:strict_limit) do
+        if string.empty?
+          yield [], 0, []
+        elsif consume_all
+          available = separator_positions.select { |position| position < string.length }
+          (0..available.length).each do |count|
+            available.combination(count) do |chosen|
+              throw :strict_limit if context
+              boundaries = [-1] + chosen + [string.length]
+              groups = boundaries.each_cons(2).map do |start_position, end_position|
+                string[(start_position + 1)...end_position]
+              end
+              yield groups, string.length, chosen
+            end
+          end
+        else
+          stop_positions = separator_positions + [string.length]
+          0.upto(stop_positions.length) do |count|
+            stop_positions.each do |stop|
+              available = separator_positions.select { |position| position < stop }
+              next unless available.length >= count
+              available.combination(count) do |chosen|
+                throw :strict_limit if context
+                boundaries = [-1] + chosen + [stop]
+                groups = boundaries.each_cons(2).map do |start_position, end_position|
+                  string[(start_position + 1)...end_position]
+                end
+                yield groups, stop, chosen
+              end
+            end
+          end
+        end
+      end
+    end
+
+    def strict_decode_map_fields(fields, operator, explode)
+      pairs = []
+      fields.each do |field|
+        if explode
+          equals = field.enum_for(:scan, /=/).map do
+            Regexp.last_match.begin(0)
+          end
+          return nil if equals.empty?
+          decoded_pairs = equals.map do |position|
+            key = strict_decode_scalar(field[0...position], operator)
+            value = strict_decode_scalar(field[(position + 1)..-1], operator)
+            [key, value]
+          end
+          return nil unless decoded_pairs.length == 1
+          pairs.concat(decoded_pairs)
+        else
+          decoded = strict_decode_scalar(field, operator)
+          return nil if decoded.nil?
+          pairs << decoded
+        end
+      end
+      return pairs.each_slice(2).to_a unless explode
+      pairs
+    end
+
+    def strict_parse_form(raw, operator, vars, index, mapping, prefixes, prior,
+                         context, &block)
+      if index >= vars.length
+        yield mapping, prefixes, strict_prefixes_partial?(prefixes) if raw.empty?
+        return
+      end
+
+      variable = vars[index]
+      name = variable["name"]
+      type = variable["type"]
+      separator = JOINERS.fetch(operator, "&")
+
+      strict_parse_form(raw, operator, vars, index + 1, mapping, prefixes,
+                        prior, context, &block)
+
+      start = 0
+      if prior
+        return unless raw.start_with?(separator)
+        start = separator.length
+      end
+      remaining = raw[start..-1] || ""
+      boundary = strict_field_boundary(remaining, separator)
+      field = remaining[0...boundary]
+      tail = remaining[boundary..-1] || ""
+
+      case type
+      when :scalar
+        value = strict_form_scalar(name, field, operator, variable)
+        if value
+          merged = strict_add_value(mapping, prefixes, name, value[0], value[1])
+          strict_parse_form(tail, operator, vars, index + 1, merged[0],
+                            merged[1], true, context, &block) if merged
+        end
+      when :list
+        if variable["explode"]
+          strict_each_form_explode_list(remaining, separator, name, operator) do |value, next_raw|
+            merged = strict_add_value(mapping, prefixes, name, value, nil)
+            next unless merged
+            strict_parse_form(next_raw, operator, vars, index + 1, merged[0],
+                              merged[1], false, context, &block)
+          end
+        elsif field.empty? || field == name
+          merged = strict_add_value(mapping, prefixes, name, [], nil)
+          next_tail = (field == name && operator == ";") ? tail[1..-1] || "" : tail
+          strict_parse_form(next_tail, operator, vars, index + 1, merged[0],
+                            merged[1], false, context, &block) if merged
+        elsif field.start_with?("#{name}=")
+          items = field[(name.length + 1)..-1].split(",", -1)
+          values = items.map { |item| strict_decode_scalar(item, operator) }
+          unless values.any?(&:nil?)
+            merged = strict_add_value(mapping, prefixes, name, values, nil)
+            strict_parse_form(tail, operator, vars, index + 1, merged[0],
+                              merged[1], true, context, &block) if merged
+          end
+        end
+      when :map
+        empty_merged = strict_add_value(mapping, prefixes, name, Hash.new, nil)
+        if empty_merged
+          strict_parse_form(raw, operator, vars, index + 1, empty_merged[0],
+                             empty_merged[1], prior, context, &block)
+        end
+        if variable["explode"]
+          strict_each_form_explode_map(remaining, separator, operator) do |value, next_raw|
+            merged = strict_add_value(mapping, prefixes, name, value, nil)
+            next unless merged
+            strict_parse_form(next_raw, operator, vars, index + 1, merged[0],
+                              merged[1], false, context, &block)
+          end
+        elsif field.start_with?(name + "=")
+          encoded_pairs = field[(name.length + 1)..-1].split(",", -1)
+          if encoded_pairs.length >= 2 && encoded_pairs.length.even?
+            pairs = strict_decode_map_fields(encoded_pairs, operator, false)
+            if pairs
+              value = {}
+              pairs.each { |key, val| value[key] = val }
+              if value.length == pairs.length
+                merged = strict_add_value(mapping, prefixes, name, value, nil)
+                if merged
+                  strict_parse_form(tail, operator, vars, index + 1, merged[0],
+                                    merged[1], true, context, &block)
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+
+    def strict_field_boundary(string, separator)
+      string.index(separator) || string.length
+    end
+
+    def strict_form_scalar(name, field, operator, variable)
+      if operator == ";" && field == name
+        ["", nil]
+      elsif field.start_with?("#{name}=")
+        raw_value = field[(name.length + 1)..-1]
+        value = strict_decode_scalar(raw_value, operator)
+        return nil if value.nil?
+        prefix = variable["prefix"]
+        if prefix && (prefix == 0 || value.length >= prefix)
+          observed = value[0...prefix]
+          expected = strict_encode_scalar(observed, operator)
+          return nil unless raw_value == expected
+          [observed, {"partial" => true, "observed" => observed}]
+        else
+          [value, nil]
+        end
+      end
+    end
+
+    def strict_each_form_explode_list(remaining, separator, name, operator)
+      fields = remaining.split(separator, -1)
+      count = fields.take_while { |item| item.start_with?(name + "=") }.length
+      1.upto(count) do |field_count|
+        values = fields[0...field_count].map do |item|
+          strict_decode_scalar(item[(name.length + 1)..-1], operator)
+        end
+        unless values.any?(&:nil?)
+          yield values, strict_remaining_fields(remaining, fields, field_count,
+                                               separator)
+        end
+      end
+    end
+
+    def strict_each_form_explode_map(remaining, separator, operator)
+      fields = remaining.split(separator, -1)
+      count = fields.take_while { |item| item.include?("=") }.length
+      1.upto(count) do |field_count|
+        pairs = strict_decode_map_fields(fields[0...field_count], operator, true)
+        next unless pairs
+        value = {}
+        pairs.each { |key, val| value[key] = val }
+        next if value.length != pairs.length
+        yield value, strict_remaining_fields(remaining, fields, field_count,
+                                            separator)
+      end
+    end
+
+    def strict_remaining_fields(remaining, fields, field_count, separator)
+      consumed = fields[0...field_count].map(&:length).inject(0, :+) +
+        field_count - 1
+      if field_count < fields.length
+        remaining[(consumed + separator.length)..-1] || ""
+      else
+        ""
+      end
+    end
+
+    def strict_add_value(mapping, prefixes, name, value, prefix)
+      if mapping.key?(name)
+        merged = strict_merge_values(
+          mapping[name], prefixes[name], value, prefix, name, prefixes
+        )
+        return nil unless merged
+        value, prefix = merged
+      end
+      new_mapping = mapping.dup
+      new_mapping[name] = nil
+      new_prefixes = prefixes.dup
+      new_mapping[name] = value
+      if prefix
+        new_prefixes[name] = prefix
+      else
+        new_prefixes.delete(name)
+      end
+      [new_mapping, new_prefixes]
+    end
+
+    def strict_merge_mapping(mapping, prefixes, local_mapping, local_prefixes)
+      result_mapping = mapping.dup
+      result_prefixes = prefixes.dup
+      local_mapping.each do |name, value|
+        if result_mapping.key?(name)
+          merged = strict_merge_values(
+            result_mapping[name], result_prefixes[name],
+            value, local_prefixes[name], name, result_prefixes
+          )
+          return nil unless merged
+          value, prefix = merged
+        else
+          prefix = local_prefixes[name]
+        end
+        result_mapping[name] = value
+        if prefix
+          result_prefixes[name] = prefix
+        else
+          result_prefixes.delete(name)
+        end
+      end
+      [result_mapping, result_prefixes]
+    end
+
+    def strict_merge_values(existing, existing_prefix, value, value_prefix,
+                           name, prefixes)
+      if existing.nil? && !existing_prefix && value.nil? && !value_prefix
+        [nil, nil]
+      elsif existing.nil? && existing_prefix && existing_prefix["pending"] &&
+            !value_prefix
+        [value, nil]
+      elsif !existing_prefix && !value_prefix
+        return nil unless existing == value
+        [existing, nil]
+      elsif String === existing && String === value
+        merged_mapping, merged_prefix = strict_merge_prefix_values(
+          existing, existing_prefix, value, value_prefix
+        )
+        return nil unless merged_mapping
+        [merged_mapping, merged_prefix]
+      else
+        nil
+      end
+    end
+
+    def strict_merge_prefix_values(existing, existing_prefix, value,
+                                   value_prefix)
+      if existing_prefix && value_prefix
+        if existing_prefix["pending"]
+          return [value, value_prefix]
+        end
+        if value_prefix["pending"]
+          return [existing, existing_prefix]
+        end
+        if existing.length >= value.length
+          return nil unless existing.start_with?(value)
+          [existing, existing_prefix]
+        else
+          return nil unless value.start_with?(existing)
+          [value, value_prefix]
+        end
+      elsif existing_prefix
+        return [value, nil] if existing_prefix["pending"]
+        return nil unless value.start_with?(existing)
+        [value, nil]
+      else
+        return nil unless existing.start_with?(value)
+        [existing, nil]
+      end
+    end
+
+    def strict_prefixes_partial?(prefixes)
+      !prefixes.empty?
+    end
+
+    ##
     # This class represents the data that is extracted when a Template
     # is matched against a URI.
     class MatchData
@@ -344,6 +821,86 @@ module Addressable
     def extract(uri, processor=nil)
       match_data = self.match(uri, processor)
       return (match_data ? match_data.mapping : nil)
+    end
+
+    ##
+    # Strictly extracts all mappings that expand back to the URI.
+    #
+    # Unlike {#extract}, this method does not silently choose one ambiguous
+    # value. Variable types must be declared as <tt>:scalar</tt>,
+    # <tt>:list</tt>, or <tt>:map</tt>.
+    #
+    # @param [Addressable::URI, #to_str] uri The URI to extract from.
+    # @param [Hash] types Variable names to <tt>:scalar</tt>, <tt>:list</tt>,
+    #   or <tt>:map</tt>.
+    # @param [Integer] max_candidates Maximum number of candidates to return.
+    #
+    # @return [Addressable::Template::StrictMatchData] The extraction result.
+    def strict_extract(uri, types={}, max_candidates=100)
+      self.strict_match(uri, types, max_candidates)
+    end
+
+    ##
+    # Strictly matches a URI while retaining ambiguous reverse matches.
+    #
+    # Each returned candidate is accepted only when expanding this template
+    # with that candidate reproduces the original URI. When the candidate limit
+    # is exceeded, the result retains only the first candidates and reports
+    # <tt>:truncated</tt>.
+    #
+    # A prefix modifier such as <tt>{x:2}</tt> cannot always recover the full
+    # value. In that case the result reports <tt>:incomplete</tt>.
+    #
+    # @param [Addressable::URI, #to_str] uri The URI to match.
+    # @param [Hash] types Variable names to <tt>:scalar</tt>, <tt>:list</tt>,
+    #   or <tt>:map</tt>.
+    # @param [Integer] max_candidates Maximum number of candidates to return.
+    #
+    # @return [Addressable::Template::StrictMatchData] The match result.
+    #
+    # @example
+    #   result = Addressable::Template.new("{+x}{+y}").strict_match(
+    #     "a/b", "x" => :scalar, "y" => :scalar
+    #   )
+    #   result.status #=> :multiple
+    #   result.candidates.length #=> 6
+    def strict_match(uri, types={}, max_candidates=100)
+      uri = Addressable::URI.parse(uri) unless uri.is_a?(Addressable::URI)
+      strict_types = strict_variable_types(types)
+      limit = strict_candidate_limit(max_candidates)
+
+      candidates = []
+      incomplete = false
+      truncated = false
+      seen = {}
+      partial_seen = {}
+      context = false
+
+      strict_search_tokens(pattern, uri.to_str, 0, 0, strict_types, {}, {},
+                           context) do |mapping, prefixes, partial|
+        key = Marshal.dump(mapping)
+        if partial
+          key = Marshal.dump([mapping, prefixes])
+          incomplete = true unless partial_seen.key?(key)
+          partial_seen[key] = true
+          next
+        end
+        next if context
+        next if seen.key?(key)
+        seen[key] = true
+        expanded = self.expand(mapping).to_str rescue nil
+        next unless expanded == uri.to_str
+        candidates << mapping
+        if candidates.length > limit
+          truncated = true
+          context = true
+        end
+      end
+
+      Addressable::Template::StrictMatchData.new(
+        uri, self, strict_types, truncated ? candidates[0...limit] : candidates,
+        incomplete, truncated, limit
+      )
     end
 
     ##
@@ -663,6 +1220,278 @@ module Addressable
           varlist.split(',').map do |varspec|
             varspec[VARSPEC, 1]
           end
+        end
+      end
+    end
+
+    def strict_variable_types(types)
+      result = {}
+      types.each do |name, type|
+        normalized_name = name.to_s
+        normalized_type = case type.to_s
+        when "scalar", "string", "str" then :scalar
+        when "list", "array" then :list
+        when "map", "hash" then :map
+        else
+          raise ArgumentError,
+            "Unknown variable type #{type.inspect} for #{name.inspect}."
+        end
+        unless self.variables.include?(normalized_name)
+          raise ArgumentError,
+            "Unknown variable #{normalized_name.inspect}."
+        end
+        result[normalized_name] = normalized_type
+      end
+      self.variables.each do |name|
+        result[name] ||= :scalar
+      end
+      result
+    end
+
+    def strict_candidate_limit(limit)
+      unless limit.is_a?(Integer) && limit > 0
+        raise ArgumentError, "max_candidates must be a positive Integer."
+      end
+      limit
+    end
+
+    def strict_tokens(pattern)
+      tokens = []
+      position = 0
+      while (match = EXPRESSION.match(pattern, position))
+        if match.begin(0) > position
+          tokens << [:literal, pattern[position...match.begin(0)]]
+        end
+        tokens << [:expression, match[0]]
+        position = match.end(0)
+      end
+      if position < pattern.length
+        tokens << [:literal, pattern[position..-1]]
+      end
+      tokens
+    end
+
+    def strict_expression_metadata(expression, types)
+      _, operator, varlist = *expression.match(EXPRESSION)
+      vars = varlist.split(",").map do |varspec|
+        _, name, modifier = *varspec.match(VARSPEC)
+        prefix = nil
+        if modifier && modifier.start_with?(":")
+          prefix = modifier[1..-1].to_i
+        end
+        {
+          "name" => name,
+          "type" => types.fetch(name),
+          "explode" => modifier == "*",
+          "prefix" => prefix
+        }
+      end
+      {"operator" => operator, "vars" => vars}
+    end
+
+    def strict_search_tokens(pattern, uri, token_index, uri_position, types,
+                             mapping, prefixes, context, &block)
+      return if context
+      tokens = strict_tokens(pattern)
+
+      if token_index >= tokens.length
+        return unless uri_position == uri.length
+        partial = strict_prefixes_partial?(prefixes)
+        if partial
+          complete = self.variables.each_with_object({}) do |name, acc|
+            acc[name] = mapping[name] if mapping.key?(name)
+          end
+          block.call(complete, prefixes, true)
+          return
+        end
+        complete = self.variables.each_with_object({}) do |name, acc|
+          acc[name] = mapping.fetch(name, nil)
+        end
+        block.call(complete, prefixes, false)
+        return
+      end
+
+      kind, value = tokens[token_index]
+      if kind == :literal
+        return unless uri[uri_position..-1].start_with?(value)
+        strict_search_tokens(
+              pattern, uri, token_index + 1, uri_position + value.length, types,
+              mapping, prefixes, context, &block
+        )
+      else
+        metadata = strict_expression_metadata(value, types)
+        last_expression = token_index == tokens.length - 1
+        strict_expression_contributions(uri, uri_position, metadata,
+                                        last_expression) do |raw, next_position|
+          strict_parse_expression(raw, metadata, context) do |local_mapping,
+                                                                local_prefixes,
+                                                                local_partial|
+            next if local_partial && local_prefixes.empty?
+            merged = strict_merge_mapping(mapping, prefixes,
+                                         local_mapping, local_prefixes)
+            next unless merged
+            merged_mapping, merged_prefixes = merged
+            metadata["vars"].each do |variable|
+              name = variable["name"]
+              next unless variable["type"] == :scalar && variable["prefix"]
+              next if local_mapping.key?(name)
+              next if merged_prefixes.key?(name)
+              merged_prefixes[name] = {
+                "partial" => true,
+                "pending" => true,
+                "prefix" => variable["prefix"]
+              }
+            end
+            strict_search_tokens(
+              pattern, uri, token_index + 1, next_position, types,
+              merged_mapping, merged_prefixes,
+              context, &block
+            )
+          end
+        end
+      end
+    end
+
+    def strict_expression_contributions(uri, position, metadata, consume_all)
+      operator = metadata["operator"]
+      leader = LEADERS.fetch(operator, "")
+      yield "", position if leader.empty?
+      if !leader.empty? && uri[position..-1].start_with?(leader)
+        body_start = position + leader.length
+        stops = consume_all ? [uri.length] : body_start.upto(uri.length).to_a
+        stops.each do |stop|
+          yield uri[body_start...stop], stop
+        end
+      elsif leader.empty?
+        stops = consume_all ? [uri.length] : (position + 1).upto(uri.length).to_a
+        stops.each do |stop|
+          yield uri[position...stop], stop
+        end
+      end
+    end
+
+    def strict_parse_expression(raw, metadata, context, &block)
+      operator = metadata["operator"]
+      vars = metadata["vars"]
+      if %w(; ? &).include?(operator)
+        strict_parse_form(raw, operator, vars, 0, {}, {}, false, context, &block)
+      else
+        strict_parse_nonform(raw, operator, vars, 0, {}, {}, false, context, &block)
+      end
+    end
+
+    def strict_allowed_scalar?(raw, operator)
+      pattern = if %w(+ #).include?(operator)
+        "\\A(?:#{RESERVED})*\\z"
+      else
+        "\\A(?:#{UNRESERVED})*\\z"
+      end
+      !!(raw =~ Regexp.new(pattern))
+    end
+
+    def strict_decode_scalar(raw, operator)
+      return nil unless strict_allowed_scalar?(raw, operator)
+      Addressable::URI.unencode_component(raw)
+    end
+
+    def strict_encode_scalar(value, operator)
+      character_class = if %w(+ #).include?(operator)
+        Addressable::URI::CharacterClassesRegexps::RESERVED_AND_UNRESERVED
+      else
+        Addressable::URI::CharacterClassesRegexps::UNRESERVED
+      end
+      Addressable::URI.encode_component(value, character_class)
+    end
+
+    def strict_each_scalar(raw, operator, variable, prior, context)
+      prefix = variable["prefix"]
+      separator = JOINERS.fetch(operator, ",")
+      start = 0
+      if prior
+        return unless raw.start_with?(separator)
+        start = separator.length
+      end
+      remaining = raw[start..-1] || ""
+      (0..remaining.length).each do |length|
+        return if context
+        chunk = remaining[0...length]
+        decoded = strict_decode_scalar(chunk, operator)
+        next if decoded.nil?
+        next_raw = raw[(start + length)..-1] || ""
+        if prefix
+          observed = decoded[0...prefix]
+          expected = strict_encode_scalar(observed, operator)
+          next unless chunk == expected
+          if prefix == 0
+            yield "", next_raw, {
+              "partial" => true,
+              "observed" => ""
+            }
+          else
+            yield observed, next_raw, {
+              "partial" => true,
+              "observed" => observed
+            }
+          end
+        else
+          yield decoded, next_raw, nil
+        end
+      end
+    end
+
+    def strict_parse_nonform(raw, operator, vars, index, mapping, prefixes, prior,
+                            context, &block)
+      if index >= vars.length
+        yield mapping, prefixes, strict_prefixes_partial?(prefixes) if raw.empty?
+        return
+      end
+
+      variable = vars[index]
+      name = variable["name"]
+      type = variable["type"]
+
+      strict_parse_nonform(
+        raw, operator, vars, index + 1, mapping, prefixes, prior, context, &block
+      )
+
+      case type
+      when :scalar
+        strict_each_scalar(raw, operator, variable, prior, context) do |value, next_raw, prefix|
+          merged = strict_add_value(mapping, prefixes, name, value, prefix)
+          next unless merged
+          strict_parse_nonform(
+            next_raw, operator, vars, index + 1, merged[0], merged[1], true,
+            context, &block
+          )
+        end
+      when :list
+        last_variable = index == vars.length - 1
+        strict_each_nonform_list(raw, operator, variable, prior, context,
+                                 last_variable) do |value, next_raw, prefix|
+          merged = strict_add_value(mapping, prefixes, name, value, prefix)
+          next unless merged
+          strict_parse_nonform(
+            next_raw, operator, vars, index + 1, merged[0], merged[1], true,
+            context, &block
+          )
+        end
+      when :map
+        empty_merged = strict_add_value(mapping, prefixes, name, Hash.new, nil)
+        if empty_merged
+          strict_parse_nonform(
+            raw, operator, vars, index + 1, empty_merged[0], empty_merged[1],
+            prior, context, &block
+          )
+        end
+        last_variable = index == vars.length - 1
+        strict_each_nonform_map(raw, operator, variable, prior, context,
+                                last_variable) do |value, next_raw, prefix|
+          merged = strict_add_value(mapping, prefixes, name, value, prefix)
+          next unless merged
+          strict_parse_nonform(
+            next_raw, operator, vars, index + 1, merged[0], merged[1], !value.empty?,
+            context, &block
+          )
         end
       end
     end
@@ -1048,5 +1877,17 @@ module Addressable
       return expansions, Regexp.new(regexp_string)
     end
 
+    private :strict_variable_types, :strict_candidate_limit, :strict_tokens,
+      :strict_expression_metadata, :strict_search_tokens,
+      :strict_expression_contributions, :strict_parse_expression,
+      :strict_allowed_scalar?, :strict_decode_scalar, :strict_encode_scalar,
+      :strict_each_scalar, :strict_parse_nonform, :strict_each_nonform_list,
+      :strict_each_nonform_map, :strict_split_positions,
+      :strict_enumerate_partitions, :strict_decode_map_fields,
+      :strict_parse_form,
+      :strict_field_boundary, :strict_form_scalar,
+      :strict_each_form_explode_list, :strict_each_form_explode_map,
+      :strict_add_value, :strict_merge_mapping, :strict_merge_values,
+      :strict_merge_prefix_values, :strict_prefixes_partial?
   end
 end

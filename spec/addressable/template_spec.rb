@@ -701,6 +701,158 @@ describe Addressable::Template do
     end
   end
 
+  describe "strict_match" do
+    let(:scalar_types) { {"x" => :scalar, "y" => :scalar} }
+
+    it "returns unique, multiple, and no match results" do
+      unique_types = {"x" => :scalar, "y" => :scalar}
+      unique = described_class.new("{x}/{y}").strict_match("a/b", unique_types)
+      expect(unique.status).to eq(:unique)
+      expect(unique.mapping).to eq({"x" => "a", "y" => "b"})
+
+      multiple = described_class.new("{x}{y}").strict_match("ab", scalar_types)
+      expect(multiple.status).to eq(:multiple)
+      expect(multiple.candidates).to include(
+        {"x" => "a", "y" => "b"},
+        {"x" => "ab", "y" => nil},
+        {"x" => nil, "y" => "ab"},
+        {"x" => "ab", "y" => ""},
+        {"x" => "", "y" => "ab"}
+      )
+
+      missing = described_class.new("a{x}").strict_match("b", {"x" => :scalar})
+      expect(missing.status).to eq(:no_match)
+      expect(missing.candidates).to eq([])
+    end
+
+    it "reveals empty-value ambiguity hidden by extract" do
+      template = described_class.new("{x}{y}")
+      expect(template.extract("")).to eq({"x" => nil, "y" => nil})
+
+      result = template.strict_match("", scalar_types)
+      expect(result.status).to eq(:multiple)
+      expect(result.candidates).to match_array([
+        {"x" => nil, "y" => nil},
+        {"x" => nil, "y" => ""},
+        {"x" => "", "y" => nil},
+        {"x" => "", "y" => ""}
+      ])
+    end
+
+    it "reveals reserved-character ambiguity hidden by extract" do
+      template = described_class.new("{+x}{+y}")
+      expect(template.extract("a/b")).to eq({"x" => nil, "y" => "a/b"})
+
+      result = template.strict_match("a/b", scalar_types)
+      expect(result.status).to eq(:multiple)
+      expect(result.candidates).to include(
+        {"x" => "a/b", "y" => nil},
+        {"x" => "a", "y" => "/b"},
+        {"x" => "a/", "y" => "b"}
+      )
+    end
+
+    it "uses strict_extract as an alias for strict_match" do
+      result = described_class.new("{x,y}").strict_extract(
+        "a,b", {"x" => :scalar, "y" => :scalar}
+      )
+      expect(result).to be_a(described_class::StrictMatchData)
+      expect(result.mapping).to eq({"x" => "a", "y" => "b"})
+    end
+
+    it "validates candidates by re-expanding them" do
+      template = described_class.new("{+x}{+y}")
+      result = template.strict_match("a/b,c", scalar_types)
+      expect(result.status).to eq(:multiple)
+      result.candidates.each do |candidate|
+        expect(template.expand(candidate).to_str).to eq("a/b,c")
+      end
+    end
+
+    it "matches declared list and map types with explode" do
+      list = described_class.new("{/list*}").strict_match(
+        "/a/b/c", {"list" => :list}
+      )
+      expect(list.status).to eq(:unique)
+      expect(list.mapping).to eq({"list" => %w(a b c)})
+
+      map = described_class.new("{?map*}").strict_match(
+        "?a=1&b=2", {"map" => :map}
+      )
+      expect(map.status).to eq(:unique)
+      expect(map.mapping).to eq({"map" => {"a" => "1", "b" => "2"}})
+    end
+
+    it "treats empty lists and maps as distinct values" do
+      list = described_class.new("{?list}").strict_match(
+        "?list=", {"list" => :list}
+      )
+      expect(list.candidates).to eq([{"list" => []}])
+
+      map = described_class.new("{map}").strict_match("", {"map" => :map})
+      expect(map.candidates).to match_array([
+        {"map" => nil},
+        {"map" => {}}
+      ])
+    end
+
+    it "enforces declared types" do
+      list = described_class.new("{x}").strict_match(
+        "a,b", {"x" => :list}
+      )
+      expect(list.mapping).to eq({"x" => %w(a b)})
+      expect(
+        described_class.new("{x}").strict_match("a,b", {"x" => :scalar})
+      ).to be_no_match
+    end
+
+    it "enforces repeated variable constraints" do
+      repeated = described_class.new("{x}/{x}").strict_match(
+        "a/a", {"x" => :scalar}
+      )
+      expect(repeated.status).to eq(:unique)
+      expect(repeated.mapping).to eq({"x" => "a"})
+      expect(
+        described_class.new("{x}/{x}").strict_match("a/b", {"x" => :scalar})
+      ).to be_no_match
+    end
+
+    it "reports insufficient information from prefix truncation" do
+      result = described_class.new("{x:2}{y}").strict_match("abc", scalar_types)
+      expect(result.status).to eq(:incomplete)
+      expect(result.candidates).to eq([])
+    end
+
+    it "recovers truncated values from repeated full variables" do
+      result = described_class.new("{x:2}/{x}").strict_match(
+        "ab/abc", {"x" => :scalar}
+      )
+      expect(result.status).to eq(:unique)
+      expect(result.mapping).to eq({"x" => "abc"})
+    end
+
+    it "reports candidate truncation rather than hiding remaining matches" do
+      result = described_class.new("{x}{y}").strict_match(
+        "ab", scalar_types, 2
+      )
+      expect(result.status).to eq(:truncated)
+      expect(result.candidates.length).to eq(2)
+      template = described_class.new("{x}{y}")
+      result.candidates.each do |candidate|
+        expect(template.expand(candidate).to_str).to eq("ab")
+      end
+    end
+
+    it "rejects invalid limits and unknown variables" do
+      expect {
+        described_class.new("{x}").strict_match("a", {}, 0)
+      }.to raise_error(ArgumentError)
+      expect {
+        described_class.new("{x}").strict_match("a", {"unknown" => :scalar})
+      }.to raise_error(ArgumentError)
+    end
+  end
+
   describe "Partial expand with symbols" do
     context "partial_expand with two simple values" do
       subject {
