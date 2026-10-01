@@ -2163,6 +2163,128 @@ describe Addressable::URI, "when parsing IPv6 address" do
   its(:hostname) { should == '3ffe:1900:4545:3:200:f8ff:fe21:67cf' }
 end
 
+describe Addressable::URI, "when parsing an IPv6 address with an RFC 6874 zone" do
+  subject(:uri) do
+    Addressable::URI.parse("http://[FE80:0000:0000:0000:0000:0000:0000:0001%25EN0]:8080/")
+  end
+
+  it "keeps the RFC 6874 encoding in host and hostname" do
+    expect(uri.host).to eq(
+      "[FE80:0000:0000:0000:0000:0000:0000:0001%25EN0]"
+    )
+    expect(uri.hostname).to eq(
+      "FE80:0000:0000:0000:0000:0000:0000:0001%25EN0"
+    )
+  end
+
+  it "exposes the address body and decoded zone separately" do
+    expect(uri.ipv6_address).to eq(
+      "FE80:0000:0000:0000:0000:0000:0000:0001"
+    )
+    expect(uri.zone_id).to eq("EN0")
+    expect(uri.zone_identifier).to eq("EN0")
+  end
+
+  it "normalizes only the address body and preserves zone casing" do
+    normalized = uri.normalize
+    expect(normalized.host).to eq("[fe80::1%25EN0]")
+    expect(normalized.ipv6_address).to eq("fe80::1")
+    expect(normalized.zone_id).to eq("EN0")
+  end
+
+  it "preserves the zone through serialization, duplication, and joining" do
+    expect(uri.to_s).to eq(
+      "http://[FE80:0000:0000:0000:0000:0000:0000:0001%25EN0]:8080/"
+    )
+    expect(uri.dup.to_s).to eq(uri.to_s)
+    expect(uri.dup.zone_id).to eq("EN0")
+    expect(uri.join("path").to_s).to eq(
+      "http://[FE80:0000:0000:0000:0000:0000:0000:0001%25EN0]:8080/path"
+    )
+  end
+
+  it "does not treat equal addresses with different zones as the same target" do
+    other = Addressable::URI.parse("http://[fe80::1%25en1]:8080/")
+    expect(uri.normalize).not_to eq(other)
+    expect(uri.hash).not_to eq(other.hash)
+  end
+
+  it "supports percent encoded characters in the decoded zone constructor" do
+    zone_aliases = [:zone_identifier, :zone_id, :zone]
+    zone_aliases.each do |zone_key|
+      constructed = Addressable::URI.new(
+        :scheme => "http",
+        :ipv6_address => "fe80::1",
+        zone_key => "en 0%/x"
+      )
+      expect(constructed.host).to eq("[fe80::1%25en%200%25%2Fx]")
+      expect(constructed.zone_id).to eq("en 0%/x")
+      expect(constructed.normalize.host).to eq("[fe80::1%25en%200%25%2Fx]")
+    end
+  end
+
+  it "preserves RFC 6874 zones through origin and authority assignment" do
+    expect(uri.origin).to eq(
+      "http://[fe80::1%25EN0]:8080"
+    )
+    copy = Addressable::URI.parse("http://example.com/")
+    copy.authority = uri.authority
+    expect(copy.zone_id).to eq("EN0")
+    expect(copy.to_s).to eq(
+      "http://[FE80:0000:0000:0000:0000:0000:0000:0001%25EN0]:8080/"
+    )
+  end
+
+  it "supports structured assignment while retaining the existing zone" do
+    copy = uri.dup
+    copy.ipv6_address = "2001:db8::1"
+    expect(copy.host).to eq("[2001:db8::1%25EN0]")
+    copy.zone_id = "en1"
+    expect(copy.zone_identifier).to eq("en1")
+    copy.zone_id = nil
+    expect(copy.host).to eq("[2001:db8::1]")
+  end
+
+  it "does not percent encode the RFC 6874 delimiter twice" do
+    expect(Addressable::URI.encode(uri.to_s)).to eq(uri.to_s)
+    expect(Addressable::URI.encode("http://user@[fe80::1%25en0]:8080/")).to eq(
+      "http://user@[fe80::1%25en0]:8080/"
+    )
+    expect(Addressable::URI.normalized_encode(uri.to_s)).to eq(
+      "http://[fe80::1%25EN0]:8080/"
+    )
+  end
+
+  [
+    "http://[fe80::1%en0]/",
+    "http://[fe80::1%25]/",
+    "http://[fe80::1%2z]/",
+    "http://[example.com%25en0]/",
+    "http://[v9.x%25en0]/"
+  ].each do |invalid_uri|
+    it "rejects #{invalid_uri}" do
+      expect do
+        Addressable::URI.parse(invalid_uri)
+      end.to raise_error(Addressable::URI::InvalidURIError)
+    end
+  end
+
+  it "rejects assigning a zone to a non-IPv6 host" do
+    expect do
+      Addressable::URI.parse("http://example.com/").zone_id = "en0"
+    end.to raise_error(Addressable::URI::InvalidURIError)
+    expect do
+      Addressable::URI.parse("http://example.com/").zone_identifier = "en0"
+    end.to raise_error(Addressable::URI::InvalidURIError)
+  end
+
+  it "rejects constructing a zone without an IPv6 address" do
+    expect do
+      Addressable::URI.new(:zone_identifier => "en0")
+    end.to raise_error(ArgumentError)
+  end
+end
+
 describe Addressable::URI, "when assigning IPv6 address" do
   it "should allow to set bare IPv6 address as hostname" do
     uri = Addressable::URI.parse("http://[::1]/")
