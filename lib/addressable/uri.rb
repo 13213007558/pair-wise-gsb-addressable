@@ -35,6 +35,12 @@ module Addressable
     end
 
     ##
+    # Raised if a filesystem path or a file URI cannot be converted for
+    # the explicitly selected platform.
+    class InvalidPathError < StandardError
+    end
+
+    ##
     # Container for the character classes specified in
     # <a href="http://www.ietf.org/rfc/rfc3986.txt">RFC 3986</a>.
     #
@@ -267,6 +273,12 @@ module Addressable
     # parsed with <code>Addressable::URI.parse</code>. Handles all of the
     # various Microsoft-specific formats for specifying paths.
     #
+    # Note: this method inspects the local filesystem and guesses path
+    # semantics from the environment it runs in. Use
+    # <code>Addressable::URI.path_to_uri</code> and
+    # <code>Addressable::URI.uri_to_path</code> when converting paths for
+    # a specific platform without touching the filesystem.
+    #
     # @param [String, Addressable::URI, #to_str] path
     #   Typically a <code>String</code> path to a file or directory, but
     #   will return a sensible return value if an absolute URI is supplied
@@ -326,6 +338,332 @@ module Addressable
 
       return uri
     end
+
+    ##
+    # Converts a filesystem path to an RFC 8089 <code>file</code> URI for
+    # an explicitly selected platform. Unlike
+    # <code>Addressable::URI.convert_path</code>, this method never looks
+    # at the local filesystem or the platform the code happens to run on,
+    # so a Linux server can safely produce URIs for Windows clients and
+    # vice versa.
+    #
+    # Supported input, per platform:
+    #
+    # - <code>:posix</code>: absolute paths such as
+    #   <code>/tmp/a file.txt</code>. A <code>//</code> prefix is preserved
+    #   as-is.
+    # - <code>:windows</code>: drive-letter absolute paths
+    #   (<code>C:\\dir\\file.txt</code> or <code>C:/dir/file.txt</code>)
+    #   and UNC paths (<code>\\\\host\\share\\file.txt</code>).
+    #   Both <code>\\</code> and <code>/</code> are accepted as
+    #   separators.
+    #
+    # Relative paths are only accepted when an absolute
+    # <code>base</code> path for the same platform is supplied; the
+    # relative path is appended to the base before conversion. No
+    # dot-segment normalization is performed in either case.
+    #
+    # Spaces, percent signs and non-ASCII characters are percent-encoded
+    # (UTF-8). A <code>localhost</code> UNC host is preserved as the URI
+    # host. Paths containing NUL bytes are rejected. Windows device
+    # paths (<code>\\\\?\\...</code>, <code>\\\\.\\...</code>),
+    # drive-relative paths (<code>C:file.txt</code>) and rooted
+    # drive-relative paths (<code>\\file.txt</code>) cannot be reliably
+    # expressed as file URIs and are rejected. The legacy
+    # <code>C|</code> drive form is not supported.
+    #
+    # @param [String, #to_str] path The path to convert.
+    #
+    # @param [Symbol, String] platform
+    #   Either <code>:posix</code> or <code>:windows</code>. Required;
+    #   there is deliberately no default derived from the host platform.
+    #
+    # @param [String, #to_str, nil] base
+    #   An absolute path for the same platform, required when
+    #   <code>path</code> is relative.
+    #
+    # @return [Addressable::URI] The file scheme URI.
+    #
+    # @raise [Addressable::URI::InvalidPathError]
+    #   If the path cannot be represented as a file URI.
+    #
+    # @example
+    #   Addressable::URI.path_to_uri("/tmp/a file.txt", platform: :posix).to_s
+    #   #=> "file:///tmp/a%20file.txt"
+    #
+    #   Addressable::URI.path_to_uri(
+    #     "C:\\My Documents\\100%.txt", platform: :windows
+    #   ).to_s
+    #   #=> "file:///C:/My%20Documents/100%25.txt"
+    #
+    #   Addressable::URI.path_to_uri(
+    #     "\\\\server\\share\\f.txt", platform: :windows
+    #   ).to_s
+    #   #=> "file://server/share/f.txt"
+    def self.path_to_uri(path, platform:, base: nil)
+      platform = file_path_platform(platform)
+      path = file_path_string(path, "path")
+      base = file_path_string(base, "base") unless base.nil?
+
+      if platform == :posix
+        posix_path_to_file_uri(path, base)
+      else
+        windows_path_to_file_uri(path, base)
+      end
+    end
+
+    ##
+    # Converts an RFC 8089 <code>file</code> URI to a filesystem path for
+    # an explicitly selected platform. This method never looks at the
+    # local filesystem, and it never strips or normalizes legal trailing
+    # characters such as slashes, dots or spaces.
+    #
+    # Supported input:
+    #
+    # - <code>:posix</code>: <code>file:</code> URIs with an empty or
+    #   <code>localhost</code> host. Any other host cannot be expressed
+    #   as a local path and is rejected.
+    # - <code>:windows</code>: URIs with an empty host must carry a
+    #   drive letter (<code>file:///C:/dir</code> becomes
+    #   <code>C:\\dir</code>); URIs with a non-empty host (including
+    #   <code>localhost</code>) become UNC paths
+    #   (<code>file://host/share/dir</code> becomes
+    #   <code>\\\\host\\share\\dir</code>) and must name a share.
+    #
+    # URIs with a query or fragment component, userinfo, a port, or a
+    # non-absolute path are rejected. Percent-encoded directory
+    # separators (<code>%2F</code>, and <code>%5C</code> on Windows) and
+    # percent-encoded NUL bytes are rejected, since decoding them would
+    # silently create extra directories or truncate paths. A bare
+    # <code>%</code> that is not part of a percent-encoding is treated
+    # as a literal percent sign.
+    #
+    # @param [String, Addressable::URI, #to_str] uri The file URI.
+    #
+    # @param [Symbol, String] platform
+    #   Either <code>:posix</code> or <code>:windows</code>. Required;
+    #   there is deliberately no default derived from the host platform.
+    #
+    # @return [String] The filesystem path.
+    #
+    # @raise [Addressable::URI::InvalidPathError]
+    #   If the URI cannot be represented as a path for the platform.
+    #
+    # @example
+    #   Addressable::URI.uri_to_path(
+    #     "file:///tmp/a%20file.txt", platform: :posix
+    #   )
+    #   #=> "/tmp/a file.txt"
+    #
+    #   Addressable::URI.uri_to_path(
+    #     "file://server/share/f.txt", platform: :windows
+    #   )
+    #   #=> "\\\\server\\share\\f.txt"
+    def self.uri_to_path(uri, platform:)
+      platform = file_path_platform(platform)
+      unless uri.kind_of?(self)
+        unless uri.respond_to?(:to_str)
+          raise TypeError, "Can't convert #{uri.class} into String."
+        end
+        uri = self.parse(uri.to_str)
+      end
+
+      scheme = uri.scheme
+      unless scheme && scheme.downcase == "file"
+        raise InvalidPathError,
+          "Only file URIs can be converted to paths, " +
+          "got scheme #{scheme.inspect}."
+      end
+      unless uri.query.nil?
+        raise InvalidPathError,
+          "File URIs with a query component cannot be converted " +
+          "to a path: #{uri.to_s.inspect}"
+      end
+      unless uri.fragment.nil?
+        raise InvalidPathError,
+          "File URIs with a fragment component cannot be converted " +
+          "to a path: #{uri.to_s.inspect}"
+      end
+      unless uri.userinfo.nil? && uri.port.nil?
+        raise InvalidPathError,
+          "File URIs with userinfo or a port cannot be converted " +
+          "to a path: #{uri.to_s.inspect}"
+      end
+      path = uri.path
+      if path.nil? || !path.start_with?(SLASH)
+        raise InvalidPathError,
+          "File URI path must be absolute: #{uri.to_s.inspect}"
+      end
+
+      segments = path.split(SLASH, -1)
+      segments.shift # Leading empty segment from the absolute path.
+      segments.map! do |segment|
+        decode_file_uri_segment(segment, platform)
+      end
+      host = uri.host
+
+      if platform == :posix
+        unless host.nil? || host.empty? || host.downcase == "localhost"
+          raise InvalidPathError,
+            "File URI host #{host.inspect} cannot be represented " +
+            "as a local posix path."
+        end
+        SLASH + segments.join(SLASH)
+      else
+        if host.nil? || host.empty?
+          drive = segments.first
+          unless drive && drive =~ /\A[a-zA-Z]:\z/
+            raise InvalidPathError,
+              "File URI #{uri.to_s.inspect} has neither a host nor " +
+              "a drive letter and cannot be represented as a windows path."
+          end
+          segments.join("\\")
+        else
+          if segments.empty? || segments.first.empty?
+            raise InvalidPathError,
+              "File URI #{uri.to_s.inspect} has a host but no share " +
+              "name and cannot be represented as a UNC path."
+          end
+          "\\\\" + host + "\\" + segments.join("\\")
+        end
+      end
+    end
+
+    # Validates and normalizes the platform selector shared by
+    # <code>path_to_uri</code> and <code>uri_to_path</code>.
+    def self.file_path_platform(platform) # :nodoc:
+      platform = platform.to_sym if platform.respond_to?(:to_sym)
+      unless [:posix, :windows].include?(platform)
+        raise ArgumentError,
+          "platform must be :posix or :windows, got #{platform.inspect}"
+      end
+      platform
+    end
+    private_class_method :file_path_platform
+
+    # Converts a path-like object to a String and rejects NUL bytes,
+    # which cannot survive either direction of the conversion.
+    def self.file_path_string(value, name) # :nodoc:
+      unless value.respond_to?(:to_str)
+        raise TypeError, "Can't convert #{value.class} into String."
+      end
+      value = value.to_str.dup
+      if value.include?("\0")
+        raise InvalidPathError,
+          "The #{name} contains a NUL byte and cannot be represented " +
+          "in a file URI."
+      end
+      value
+    end
+    private_class_method :file_path_string
+
+    # Builds a file URI from an absolute or base-relative posix path.
+    def self.posix_path_to_file_uri(path, base) # :nodoc:
+      unless path.start_with?(SLASH)
+        if base.nil?
+          raise InvalidPathError,
+            "Relative path #{path.inspect} requires an absolute " +
+            "posix base path."
+        end
+        unless base.start_with?(SLASH)
+          raise InvalidPathError,
+            "Base path #{base.inspect} is not an absolute posix path."
+        end
+        path = base.sub(%r{/+\z}, EMPTY_STR) + SLASH + path
+      end
+      encoded_path = path.split(SLASH, -1).map do |segment|
+        encode_component(segment, CharacterClasses::PCHAR)
+      end.join(SLASH)
+      uri = self.new
+      uri.scheme = "file"
+      uri.host = EMPTY_STR
+      uri.path = encoded_path
+      uri
+    end
+    private_class_method :posix_path_to_file_uri
+
+    # Builds a file URI from a windows path, accepting both drive-letter
+    # absolute paths and UNC paths.
+    def self.windows_path_to_file_uri(path, base) # :nodoc:
+      if path =~ /\A[\\\/]{2}[.?]/
+        raise InvalidPathError,
+          "Windows device paths cannot be reliably represented as " +
+          "file URIs: #{path.inspect}"
+      end
+      if path =~ /\A[a-zA-Z]:(?![\\\/])/
+        raise InvalidPathError,
+          "Drive-relative paths cannot be reliably represented as " +
+          "file URIs: #{path.inspect}"
+      end
+      if path =~ /\A[\\\/](?![\\\/])/
+        raise InvalidPathError,
+          "Rooted drive-relative paths cannot be reliably represented " +
+          "as file URIs: #{path.inspect}"
+      end
+
+      if path =~ /\A[\\\/]{2}/ || path =~ /\A[a-zA-Z]:[\\\/]/
+        absolute = path
+      else
+        if base.nil?
+          raise InvalidPathError,
+            "Relative path #{path.inspect} requires an absolute " +
+            "windows base path."
+        end
+        unless base =~ /\A[\\\/]{2}(?![.?])/ ||
+            base =~ /\A[a-zA-Z]:[\\\/]/
+          raise InvalidPathError,
+            "Base path #{base.inspect} is not an absolute windows path."
+        end
+        absolute = base.sub(/[\\\/]+\z/, EMPTY_STR) + "\\" + path
+      end
+
+      if absolute =~ /\A[\\\/]{2}/
+        host, share, *rest = absolute[2..-1].split(/[\\\/]/, -1)
+        if host.nil? || host.empty? || share.nil? || share.empty?
+          raise InvalidPathError,
+            "UNC paths require both a host and a share name: " +
+            "#{absolute.inspect}"
+        end
+        segments = [share] + rest
+      else
+        drive = absolute[0..1]
+        rest = absolute[3..-1]
+        rest_segments = rest.nil? || rest.empty? ?
+          [EMPTY_STR] : rest.split(/[\\\/]/, -1)
+        segments = [drive] + rest_segments
+        host = nil
+      end
+      encoded_path = SLASH + segments.map do |segment|
+        encode_component(segment, CharacterClasses::PCHAR)
+      end.join(SLASH)
+      uri = self.new
+      uri.scheme = "file"
+      uri.host = host.nil? ? EMPTY_STR : host
+      uri.path = encoded_path
+      uri
+    end
+    private_class_method :windows_path_to_file_uri
+
+    # Decodes one file URI path segment, rejecting encodings that would
+    # turn into directory separators or NUL bytes.
+    def self.decode_file_uri_segment(segment, platform) # :nodoc:
+      if segment =~ /%00/i
+        raise InvalidPathError,
+          "Percent-encoded NUL bytes are not allowed in file URI paths."
+      end
+      if segment =~ (platform == :windows ? /%(2f|5c)/i : /%2f/i)
+        raise InvalidPathError,
+          "Percent-encoded directory separators are not allowed " +
+          "in file URI paths."
+      end
+      decoded = unencode(segment)
+      if decoded.include?("\0")
+        raise InvalidPathError,
+          "NUL bytes are not allowed in file URI paths."
+      end
+      decoded
+    end
+    private_class_method :decode_file_uri_segment
 
     ##
     # Joins several URIs together.
