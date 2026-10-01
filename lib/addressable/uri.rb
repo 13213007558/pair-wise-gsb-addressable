@@ -24,6 +24,8 @@ require "public_suffix"
 ##
 # Addressable is a library for processing links and URIs.
 module Addressable
+  autoload :URN, "addressable/urn"
+
   ##
   # This is an implementation of a URI parser based on
   # <a href="http://www.ietf.org/rfc/rfc3986.txt">RFC 3986</a>,
@@ -132,46 +134,70 @@ module Addressable
         raise TypeError, "Can't convert #{uri.class} into String."
       end unless uri.is_a?(String)
 
-      # This Regexp supplied as an example in RFC 3986, and it works great.
-      scan = uri.scan(URIREGEX)
-      fragments = scan[0]
-      scheme = fragments[1]
-      authority = fragments[3]
-      path = fragments[4]
-      query = fragments[6]
-      fragment = fragments[8]
-      user = nil
-      password = nil
-      host = nil
-      port = nil
-      if authority != nil
-        # The Regexp above doesn't split apart the authority.
-        userinfo = authority[/^([^\[\]]*)@/, 1]
-        if userinfo != nil
-          user = userinfo.strip[/^([^:]*):?/, 1]
-          password = userinfo.strip[/:(.*)$/, 1]
+      components = parse_uri_components(uri)
+      if components[:scheme] && components[:scheme].downcase == "urn"
+        return ::Addressable::URN.new(
+          :path => components[:path],
+          :query => components[:query],
+          :fragment => components[:fragment]
+        )
+      end
+      new(
+        :scheme => components[:scheme],
+        :user => components[:user],
+        :password => components[:password],
+        :host => components[:host],
+        :port => components[:port],
+        :path => components[:path],
+        :query => components[:query],
+        :fragment => components[:fragment]
+      )
+    end
+
+    class << self
+      private
+
+      def parse_uri_components(uri)
+        # This Regexp supplied as an example in RFC 3986, and it works great.
+        scan = uri.scan(URIREGEX)
+        fragments = scan[0]
+        scheme = fragments[1]
+        authority = fragments[3]
+        path = fragments[4]
+        query = fragments[6]
+        fragment = fragments[8]
+        user = nil
+        password = nil
+        host = nil
+        port = nil
+        if authority != nil
+          userinfo = authority[/^([^\[\]]*)@/, 1]
+          if userinfo != nil
+            user = userinfo.strip[/^([^:]*):?/, 1]
+            password = userinfo.strip[/:(.*)$/, 1]
+          end
+
+          host = authority.sub(
+            /^([^\[\]]*)@/, EMPTY_STR
+          ).sub(
+            /:([^:@\[\]]*?)$/, EMPTY_STR
+          )
+
+          port = authority[/:([^:@\[\]]*?)$/, 1]
+          port = nil if port == EMPTY_STR
         end
 
-        host = authority.sub(
-          /^([^\[\]]*)@/, EMPTY_STR
-        ).sub(
-          /:([^:@\[\]]*?)$/, EMPTY_STR
-        )
-
-        port = authority[/:([^:@\[\]]*?)$/, 1]
-        port = nil if port == EMPTY_STR
+        {
+          :scheme => scheme,
+          :user => user,
+          :password => password,
+          :host => host,
+          :port => port,
+          :path => path,
+          :query => query,
+          :fragment => fragment
+        }
       end
-
-      return new(
-        :scheme => scheme,
-        :user => user,
-        :password => password,
-        :host => host,
-        :port => port,
-        :path => path,
-        :query => query,
-        :fragment => fragment
-      )
     end
 
     ##

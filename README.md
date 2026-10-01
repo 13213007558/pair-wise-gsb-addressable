@@ -23,11 +23,13 @@ Addressable is an alternative implementation to the URI implementation
 that is part of Ruby's standard library. It is flexible, offers heuristic
 parsing, and additionally provides extensive support for IRIs and URI templates.
 
-Addressable closely conforms to RFC 3986, RFC 3987, and RFC 6570 (level 4).
+Addressable closely conforms to RFC 3986, RFC 3987, RFC 8141, and
+RFC 6570 (level 4).
 
 ## Reference
 
 - {Addressable::URI}
+- {Addressable::URN}
 - {Addressable::Template}
 
 ## Example usage
@@ -47,6 +49,32 @@ uri = Addressable::URI.parse("http://www.詹姆斯.com/")
 uri.normalize
 #=> #<Addressable::URI:0xc9a4c8 URI:http://www.xn--8ws00zhy3a.com/>
 ```
+
+
+## URNs
+
+RFC 8141 URNs are represented by `Addressable::URN`. The generic parser returns
+this class for the `urn` scheme while retaining the usual `URI` API.
+
+```ruby
+require "addressable/uri"
+
+urn = Addressable::URI.parse("urn:example:Resource%2FName?+r?=q#f")
+urn.class              #=> Addressable::URN
+urn.nid                #=> "example"
+urn.nss                #=> "Resource%2FName"
+urn.r_component        #=> "r"
+urn.q_component        #=> "q"
+urn.fragment           #=> "f"
+urn.path               #=> "example:Resource%2FName"
+urn.query              #=> "+r?=q"
+urn.same_resource?("urn:example:Resource%2FName?+other") #=> true
+```
+
+Unknown namespaces receive only the minimal normalization allowed by RFC 8141:
+case-insensitive scheme and NID normalization and percent-encoding case
+normalization. Namespace-specific NSS rules may be registered with
+`Addressable::URN.register_namespace`.
 
 
 ## URI Templates
