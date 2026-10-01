@@ -631,8 +631,15 @@ module Addressable
       encoded_uri = Addressable::URI.new(
         :scheme => self.encode_component(uri_object.scheme,
           Addressable::URI::CharacterClassesRegexps::SCHEME),
-        :authority => self.encode_component(uri_object.authority,
+        :user => self.encode_component(uri_object.user,
           Addressable::URI::CharacterClassesRegexps::AUTHORITY),
+        :password => self.encode_component(uri_object.password,
+          Addressable::URI::CharacterClassesRegexps::AUTHORITY),
+        :host => uri_object.host &&
+          uri_object.host.start_with?('[') ? uri_object.host :
+          self.encode_component(uri_object.host,
+            Addressable::URI::CharacterClassesRegexps::HOST),
+        :port => uri_object.port,
         :path => self.encode_component(uri_object.path,
           Addressable::URI::CharacterClassesRegexps::PATH),
         :query => self.encode_component(uri_object.query,
@@ -685,7 +692,9 @@ module Addressable
         :scheme => self.unencode_component(uri_object.scheme),
         :user => self.unencode_component(uri_object.user),
         :password => self.unencode_component(uri_object.password),
-        :host => self.unencode_component(uri_object.host),
+        :host => uri_object.host &&
+          uri_object.host.start_with?('[') ?
+          uri_object.host : self.unencode_component(uri_object.host),
         :port => (uri_object.port.nil? ? nil : uri_object.port.to_s),
         :path => self.unencode_component(uri_object.path),
         :query => self.unencode_component(uri_object.query),
@@ -818,6 +827,10 @@ module Addressable
     #   The userinfo component. If this is supplied, the user and password
     #   components must be omitted.
     # @option [String, #to_str] host The host component.
+    # @option [String, #to_str] zone The decoded IPv6 zone identifier.
+    # @option [String, #to_str] zone_id Alias for `:zone`.
+    # @option [String, #to_str] ipv6_address A bare IPv6 address.
+    # @option [String, #to_str] ip_address Alias for `:ipv6_address`.
     # @option [String, #to_str] port The port component.
     # @option [String, #to_str] authority
     #   The authority component. If this is supplied, the user, password,
@@ -828,12 +841,30 @@ module Addressable
     #
     # @return [Addressable::URI] The constructed URI object.
     def initialize(options={})
+      zone_keys = [:zone, :zone_id]
+      ipv6_address_keys = [:ipv6_address, :ip_address]
       if options.has_key?(:authority)
-        if (options.keys & [:userinfo, :user, :password, :host, :port]).any?
+        authority_components = [
+          :userinfo, :user, :password, :host, :port
+        ] + zone_keys + ipv6_address_keys
+        if (options.keys & authority_components).any?
           raise ArgumentError,
             "Cannot specify both an authority and any of the components " +
             "within the authority."
         end
+      end
+      if (options.keys & zone_keys).length > 1
+        raise ArgumentError,
+          "Cannot specify both a zone and a zone_id."
+      end
+      if (options.keys & ipv6_address_keys).length > 1
+        raise ArgumentError,
+          "Cannot specify both an ipv6_address and an ip_address."
+      end
+      if options.has_key?(:host) &&
+          (options.keys & ipv6_address_keys).any?
+        raise ArgumentError,
+          "Cannot specify both a host and an IPv6 address."
       end
       if options.has_key?(:userinfo)
         if (options.keys & [:user, :password]).any?
@@ -852,6 +883,14 @@ module Addressable
         self.password = options[:password] if options[:password]
         self.userinfo = options[:userinfo] if options[:userinfo]
         self.host = options[:host] if options[:host]
+        ipv6_address_key = (options.keys & ipv6_address_keys).first
+        if ipv6_address_key
+          self.ipv6_address = options[ipv6_address_key]
+        end
+        zone_key = (options.keys & zone_keys).first
+        if zone_key
+          self.zone = options[zone_key]
+        end
         self.port = options[:port] if options[:port]
         self.authority = options[:authority] if options[:authority]
         self.path = options[:path] if options[:path]
@@ -1116,6 +1155,10 @@ module Addressable
     ##
     # The host component for this URI.
     #
+    # IP-literal hosts retain their URI serialization, including square
+    # brackets. For a scoped IPv6 address, the RFC 6874 zone delimiter is
+    # `%25`; use {#zone} or {#zone_id} to read the decoded zone identifier.
+    #
     # @return [String] The host component.
     attr_reader :host
 
@@ -1127,19 +1170,20 @@ module Addressable
       return nil unless self.host
 
       @normalized_host ||= begin
-        if !self.host.strip.empty?
-          result = ::Addressable::IDNA.to_ascii(
-            URI.unencode_component(self.host.strip.downcase)
-          )
-          if result =~ /[^\.]\.$/
-            # Single trailing dots are unnecessary.
-            result = result[0...-1]
+        if !self.host.strip.empty? && self.host.start_with?('[')
+          components = ipv6_host_components(self.host, false)
+          if components
+            address, encoded_zone = components
+            normalized = normalize_ipv6_address(address)
+            if encoded_zone
+              normalized << "%25" << normalize_percent_encoding(encoded_zone)
+            end
+            "[#{normalized}]"
+          else
+            normalize_reg_name_host(self.host)
           end
-          result = Addressable::URI.normalize_component(
-            result,
-            NormalizeCharacterClasses::HOST
-          )
-          result
+        elsif !self.host.strip.empty?
+          normalize_reg_name_host(self.host)
         else
           EMPTY_STR.dup
         end
@@ -1148,6 +1192,142 @@ module Addressable
       force_utf8_encoding_if_needed(@normalized_host)
       @normalized_host
     end
+
+    ##
+    # The host component without IP-literal brackets.
+    #
+    # This remains a URI component accessor for compatibility with Ruby's
+    # `URI::Generic#hostname`. Scoped IPv6 zones therefore remain in their
+    # RFC 6874 encoded form here. Use {#ipv6_address} and {#zone} to access
+    # the decoded components.
+    #
+    # @return [String] The hostname for this URI.
+    def hostname
+      v = self.host
+      /\A\[(.*)\]\z/ =~ v ? $1 : v
+    end
+
+    ##
+    # Sets the host component without IP-literal brackets.
+    #
+    # A bare IPv6 address is wrapped in square brackets. If the value already
+    # contains an RFC 6874 encoded scoped IPv6 address, its encoding is used
+    # verbatim. A literal `%` introducing a zone is not accepted; assign the
+    # decoded value with {#zone=} instead.
+    #
+    # @param [String, #to_str] new_hostname The new hostname for this URI.
+    def hostname=(new_hostname)
+      if new_hostname &&
+          (new_hostname.respond_to?(:ipv4?) || new_hostname.respond_to?(:ipv6?))
+        new_host = new_hostname.to_s
+        if new_hostname.respond_to?(:ipv6?) && new_hostname.ipv6? &&
+            new_hostname.respond_to?(:zone_id) && new_hostname.zone_id
+          zone_id = new_hostname.zone_id[1..-1]
+          new_host = new_host.sub(/%#{Regexp.escape(zone_id)}\z/, '')
+          self.hostname = new_host
+          self.zone = zone_id
+          return new_hostname
+        end
+        new_hostname = new_host
+      elsif new_hostname && !new_hostname.respond_to?(:to_str)
+        raise TypeError, "Can't convert #{new_hostname.class} into String."
+      end
+      v = new_hostname ? new_hostname.to_str : nil
+      v = "[#{v}]" if /\A\[.*\]\z/ !~ v && /:/ =~ v
+      self.host = v
+    end
+
+    ##
+    # Returns the IPv6 address body without brackets or zone identifier.
+    #
+    # @return [String, nil] The bare IPv6 address, or `nil` for non-IPv6 hosts.
+    def ipv6_address
+      components = ipv6_host_components(self.host, false)
+      components && components[0]
+    end
+    alias_method :ip_address, :ipv6_address
+
+    ##
+    # Sets an IPv6 address while retaining any existing zone identifier.
+    #
+    # @param [String, #to_str] new_address The new bare IPv6 address.
+    def ipv6_address=(new_address)
+      if new_address &&
+          (new_address.respond_to?(:ipv4?) || new_address.respond_to?(:ipv6?))
+        if new_address.respond_to?(:ipv6?) && !new_address.ipv6?
+          raise InvalidURIError,
+            "Expected an IPv6 address, got #{new_address.inspect}"
+        end
+        new_host = new_address.to_s
+        if new_address.respond_to?(:ipv6?) && new_address.ipv6? &&
+            new_address.respond_to?(:zone_id) && new_address.zone_id
+          zone_id = new_address.zone_id[1..-1]
+          new_host = new_host.sub(/%#{Regexp.escape(zone_id)}\z/, '')
+          self.ipv6_address = new_host
+          self.zone = zone_id
+          return new_address
+        end
+        new_address = new_host
+      elsif new_address && !new_address.respond_to?(:to_str)
+        raise TypeError, "Can't convert #{new_address.class} into String."
+      end
+      address = new_address && new_address.to_str
+      address = address[1...-1] if address && address.start_with?('[') &&
+        address.end_with?(']')
+      unless address
+        self.host = nil
+        return nil
+      end
+      components = ipv6_host_components(self.host, false) if self.host
+      encoded_zone = components && components[1]
+      new_host = "[#{address}]"
+      new_host = "[#{address}%25#{encoded_zone}]" if encoded_zone
+      self.host = new_host
+    end
+    alias_method :ip_address=, :ipv6_address=
+
+    ##
+    # Returns the decoded RFC 6874 IPv6 zone identifier.
+    #
+    # @return [String, nil] The decoded zone identifier, or `nil`.
+    def zone
+      components = ipv6_host_components(self.host, false)
+      encoded_zone = components && components[1]
+      encoded_zone && decode_zone(encoded_zone)
+    end
+    alias_method :zone_id, :zone
+
+    ##
+    # Sets the decoded IPv6 zone identifier.
+    #
+    # The value is encoded according to RFC 6874 when serialized. Assigning
+    # `nil` removes the zone identifier.
+    #
+    # @param [String, #to_str] new_zone The decoded zone identifier.
+    def zone=(new_zone)
+      if new_zone && !new_zone.respond_to?(:to_str)
+        raise TypeError, "Can't convert #{new_zone.class} into String."
+      end
+      components = self.host ?
+        ipv6_host_components(self.host, false) : nil
+      if !components
+        raise InvalidURIError,
+          "Cannot set a zone identifier on a non-IPv6 host: " +
+          self.host.inspect
+      end
+      if new_zone
+        new_zone = new_zone.to_str
+        if new_zone.empty?
+          raise InvalidURIError, "IPv6 zone identifier cannot be empty."
+        end
+        encoded_zone = encode_zone(new_zone)
+        self.host = "[#{components[0]}%25#{encoded_zone}]"
+        new_zone
+      else
+        self.host = "[#{components[0]}]"
+      end
+    end
+    alias_method :zone_id=, :zone=
 
     ##
     # Sets the host component for this URI.
@@ -1168,35 +1348,19 @@ module Addressable
       validate()
     end
 
-    ##
-    # This method is same as URI::Generic#host except
-    # brackets for IPv6 (and 'IPvFuture') addresses are removed.
-    #
-    # @see Addressable::URI#host
-    #
-    # @return [String] The hostname for this URI.
-    def hostname
-      v = self.host
-      /\A\[(.*)\]\z/ =~ v ? $1 : v
-    end
-
-    ##
-    # This method is same as URI::Generic#host= except
-    # the argument can be a bare IPv6 address (or 'IPvFuture').
-    #
-    # @see Addressable::URI#host=
-    #
-    # @param [String, #to_str] new_hostname The new hostname for this URI.
-    def hostname=(new_hostname)
-      if new_hostname &&
-          (new_hostname.respond_to?(:ipv4?) || new_hostname.respond_to?(:ipv6?))
-        new_hostname = new_hostname.to_s
-      elsif new_hostname && !new_hostname.respond_to?(:to_str)
-        raise TypeError, "Can't convert #{new_hostname.class} into String."
+    def normalize_reg_name_host(host)
+      result = ::Addressable::IDNA.to_ascii(
+        URI.unencode_component(host.strip.downcase)
+      )
+      if result =~ /[^\.]\.$/
+        # Single trailing dots are unnecessary.
+        result = result[0...-1]
       end
-      v = new_hostname ? new_hostname.to_str : nil
-      v = "[#{v}]" if /\A\[.*\]\z/ !~ v && /:/ =~ v
-      self.host = v
+      result = Addressable::URI.normalize_component(
+        result,
+        NormalizeCharacterClasses::HOST
+      )
+      result
     end
 
     ##
@@ -1340,7 +1504,7 @@ module Addressable
         unless new_scheme
           raise InvalidURIError, 'An origin cannot omit the scheme.'
         end
-        new_host = new_origin[/:\/\/([^\/?#:]+)/, 1]
+        new_host = new_origin[/:\/\/(\[[^\]]*\]|[^\/?#:]+)/, 1]
         unless new_host
           raise InvalidURIError, 'An origin cannot omit the host.'
         end
@@ -2422,7 +2586,7 @@ module Addressable
       nil
     end
 
-  protected
+    protected
     SELF_REF = '.'
     PARENT = '..'
 
@@ -2430,6 +2594,149 @@ module Addressable
     RULE_2B_2C = /\/([^\/]*)\/\.\.\/|\/([^\/]*)\/\.\.$/
     RULE_2D = /^\.\.?\/?/
     RULE_PREFIXED_PARENT = /^\/\.\.?\/|^(\/\.\.?)+\/?$/
+
+    IPV6_HEXTET = /\A[0-9a-f]{1,4}\z/i
+    IPV6_ZONE_CHARACTERS = /\A(?:[A-Za-z0-9\-._~]|%[0-9A-Fa-f]{2})*\z/
+    IPV_FUTURE = /\Av[0-9a-f]+\.[A-Za-z0-9\-._~!$&'()*+,;=:]+\z/i
+
+    def ipv6_host_components(host, strict)
+      return nil unless host && host.start_with?('[') && host.end_with?(']')
+
+      literal = host[1...-1]
+      delimiter = /%25/i.match(literal)
+      if delimiter
+        address = literal[0...delimiter.begin(0)]
+        encoded_zone = literal[(delimiter.end(0))..-1]
+        begin
+          parse_ipv6_address(address)
+          if encoded_zone.empty? ||
+              !(IPV6_ZONE_CHARACTERS =~ encoded_zone.dup.force_encoding(
+                Encoding::ASCII_8BIT
+              ))
+            raise InvalidURIError, "Invalid IPv6 zone identifier: #{host}"
+          end
+        rescue InvalidURIError
+          raise if strict
+          return nil
+        end
+        return [address, encoded_zone]
+      end
+
+      return nil if !strict && IPV_FUTURE =~ literal
+      return [literal, nil] if !strict && valid_ipv6_address?(literal)
+      return nil unless strict
+      return nil if IPV_FUTURE =~ literal
+
+      begin
+        parse_ipv6_address(literal)
+      rescue InvalidURIError
+        raise InvalidURIError, "Invalid IP-literal host: #{host}"
+      end
+      [literal, nil]
+    end
+
+    def valid_ipv6_address?(address)
+      parse_ipv6_address(address)
+      true
+    rescue InvalidURIError
+      false
+    end
+
+    def parse_ipv6_address(address)
+      pieces = address.split('::', -1)
+      if pieces.length > 2 || address.empty? || address.include?(':::')
+        raise InvalidURIError, "Invalid IPv6 address: #{address}"
+      end
+
+      if pieces.length == 1
+        groups = parse_ipv6_piece(pieces[0], false, address)
+        unless groups.length == 8
+          raise InvalidURIError, "Invalid IPv6 address: #{address}"
+        end
+        return groups
+      end
+
+      left = parse_ipv6_piece(pieces[0], true, address)
+      right = parse_ipv6_piece(pieces[1], true, address)
+      missing = 8 - left.length - right.length
+      if missing < 1
+        raise InvalidURIError, "Invalid IPv6 address: #{address}"
+      end
+      left + Array.new(missing, 0) + right
+    end
+
+    def parse_ipv6_piece(piece, allow_empty, address)
+      return [] if allow_empty && piece.empty?
+
+      hextets = piece.split(':')
+      if hextets.last && hextets.last.include?('.')
+        dotted = hextets.pop
+        octets = dotted.split('.', -1)
+        unless octets.length == 4 &&
+            octets.all? { |octet| octet =~ /\A\d+\z/ && octet.to_i <= 255 }
+          raise InvalidURIError, "Invalid IPv6 address: #{address}"
+        end
+        values = octets.map(&:to_i)
+        hextets << format('%x', values[0] * 256 + values[1])
+        hextets << format('%x', values[2] * 256 + values[3])
+      end
+
+      unless hextets.all? { |hextet| hextet =~ IPV6_HEXTET }
+        raise InvalidURIError, "Invalid IPv6 address: #{address}"
+      end
+      hextets.map { |hextet| hextet.to_i(16) }
+    end
+
+    def normalize_ipv6_address(address)
+      groups = parse_ipv6_address(address)
+      best_start = nil
+      best_length = 0
+      current_start = nil
+      groups.each_with_index do |group, index|
+        if group == 0
+          current_start ||= index
+        else
+          length = index - current_start if current_start
+          if length && length > best_length
+            best_start = current_start
+            best_length = length
+          end
+          current_start = nil
+        end
+      end
+      if current_start
+        length = groups.length - current_start
+        if length > best_length
+          best_start = current_start
+          best_length = length
+        end
+      end
+
+      hextets = groups.map { |group| format('%x', group) }
+      return hextets.join(':') if best_length < 2
+
+      left = hextets[0...best_start].join(':')
+      right = hextets[(best_start + best_length)..-1].join(':')
+      "#{left}::#{right}"
+    end
+
+    def encode_zone(zone)
+      Addressable::URI.encode_component(
+        zone, Addressable::URI::CharacterClassesRegexps::UNRESERVED
+      )
+    end
+
+    def decode_zone(encoded_zone)
+      encoded_zone = encoded_zone.dup.force_encoding(Encoding::ASCII_8BIT)
+      unless IPV6_ZONE_CHARACTERS =~ encoded_zone
+        raise InvalidURIError, "Invalid IPv6 zone identifier: #{encoded_zone}"
+      end
+      Addressable::URI.unencode_component(encoded_zone)
+    end
+
+    def normalize_percent_encoding(encoded_zone)
+      encode_zone(decode_zone(encoded_zone))
+    end
 
     ##
     # Resolves paths to their simplest form.
@@ -2499,12 +2806,21 @@ module Addressable
           "Cannot have a path with two leading slashes " +
           "without an authority set: '#{self.to_s}'"
       end
-      unreserved = CharacterClasses::UNRESERVED
-      sub_delims = CharacterClasses::SUB_DELIMS
-      if !self.host.nil? && (self.host =~ /[<>{}\/\\\?\#\@"[[:space:]]]/ ||
-          (self.host[/^\[(.*)\]$/, 1] != nil && self.host[/^\[(.*)\]$/, 1] !~
-          Regexp.new("^[#{unreserved}#{sub_delims}:]*$")))
+      if !self.host.nil? && self.host =~ /[<>{}\/\\\?\#\@"[[:space:]]]/
         raise InvalidURIError, "Invalid character in host: '#{self.host.to_s}'"
+      end
+      if !self.host.nil? && !self.host.start_with?('[') &&
+          self.host =~ /[\[\]]/
+        raise InvalidURIError, "Invalid character in host: '#{self.host.to_s}'"
+      end
+      unless self.host.nil? || !self.host.start_with?('[')
+        literal = self.host[/^\[(.*)\]$/, 1]
+        if literal.nil?
+          raise InvalidURIError, "Invalid character in host: '#{self.host.to_s}'"
+        end
+        if literal !~ IPV_FUTURE
+          ipv6_host_components(self.host, true)
+        end
       end
       return nil
     end
