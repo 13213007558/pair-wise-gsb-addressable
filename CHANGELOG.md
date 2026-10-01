@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+- add explicit, filesystem-free RFC 8089 file URI/path conversion for POSIX
+  and Windows, including Windows drives, UNC, localhost, relative bases, and
+  strict rejection of ambiguous or unrepresentable forms
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)

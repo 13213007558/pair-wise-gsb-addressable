@@ -25,6 +25,23 @@ parsing, and additionally provides extensive support for IRIs and URI templates.
 
 Addressable closely conforms to RFC 3986, RFC 3987, and RFC 6570 (level 4).
 
+File URI conversion follows RFC 8089 and requires an explicit target platform,
+`:posix` or `:windows`; it performs string conversion only and never inspects
+the server filesystem. Relative paths and URIs require an absolute same-platform
+base. Windows drive and UNC paths are supported; device paths, drive-relative
+paths, and query or fragment components are rejected because they cannot be
+represented reliably.
+
+```ruby
+Addressable::URI.path_to_file_uri("C:\\Users\\Me\\file.txt", :windows)
+#=> #<Addressable::URI URI:file:///C:/Users/Me/file.txt>
+
+Addressable::URI.file_uri_to_path(
+  "file://server/share/file.txt", :windows
+)
+#=> "\\\\server\\share\\file.txt"
+```
+
 ## Reference
 
 - {Addressable::URI}

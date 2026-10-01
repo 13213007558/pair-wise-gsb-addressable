@@ -35,6 +35,11 @@ module Addressable
     end
 
     ##
+    # Raised when a file URI or path cannot be represented reliably.
+    class InvalidFileURIError < InvalidURIError
+    end
+
+    ##
     # Container for the character classes specified in
     # <a href="http://www.ietf.org/rfc/rfc3986.txt">RFC 3986</a>.
     #
@@ -73,6 +78,7 @@ module Addressable
       AUTHORITY = /[^#{CharacterClasses::AUTHORITY}]/
       FRAGMENT = /[^#{CharacterClasses::FRAGMENT}]/
       HOST = /[^#{CharacterClasses::HOST}]/
+      PCHAR = /[^#{CharacterClasses::PCHAR}]/
       PATH = /[^#{CharacterClasses::PATH}]/
       QUERY = /[^#{CharacterClasses::QUERY}]/
       RESERVED = /[^#{CharacterClasses::RESERVED}]/
@@ -83,6 +89,12 @@ module Addressable
 
     SLASH = '/'
     EMPTY_STR = ''
+
+    FILE_PLATFORMS = [:posix, :windows].freeze
+    FILE_SCHEME = "file".freeze
+    LOCAL_FILE_HOSTS = [EMPTY_STR, "localhost"].freeze
+    WINDOWS_FILE_SEPARATOR = /[\/\\]/
+    WINDOWS_INVALID_FILE_CHARACTER = /[\x00-\x1f<>"|?*]/
 
     URIREGEX = /^(([^:\/?#]+):)?(\/\/([^\/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?$/
 
@@ -261,11 +273,9 @@ module Addressable
     end
 
     ##
-    # Converts a path to a file scheme URI. If the path supplied is
-    # relative, it will be returned as a relative URI. If the path supplied
-    # is actually a non-file URI, it will parse the URI as if it had been
-    # parsed with <code>Addressable::URI.parse</code>. Handles all of the
-    # various Microsoft-specific formats for specifying paths.
+    # Converts a path to a URI. This is a legacy, host-platform-oriented
+    # helper and also accepts non-file URIs. New code should use
+    # {URI.path_to_file_uri} with an explicit platform.
     #
     # @param [String, Addressable::URI, #to_str] path
     #   Typically a <code>String</code> path to a file or directory, but
@@ -310,11 +320,6 @@ module Addressable
           "/#{$1.downcase}:/"
         end
         uri.path.tr!("\\", SLASH)
-        if File.exist?(uri.path) &&
-            File.stat(uri.path).directory?
-          uri.path.chomp!(SLASH)
-          uri.path = uri.path + '/'
-        end
 
         # If the path is absolute, set the scheme and host.
         if uri.path.start_with?(SLASH)
@@ -325,6 +330,542 @@ module Addressable
       end
 
       return uri
+    end
+
+    ##
+    # Converts a local filesystem path to an RFC 8089 file URI. The target
+    # platform is always explicit; the platform running the current process
+    # is never inspected and the filesystem is never accessed.
+    #
+    # POSIX inputs must be absolute. Windows inputs may be drive absolute or
+    # UNC paths. Relative paths are accepted only when +base+ is an absolute
+    # path or file URI for the same platform. Windows device paths and paths
+    # relative to a drive are not representable reliably and are rejected.
+    #
+    # Supported URI forms on the reverse direction include local paths,
+    # +localhost+, Windows UNC authorities, and legacy +C|+ drive paths.
+    # Remote authorities are not representable as POSIX paths. Query and
+    # fragment components are not supported for local files.
+    #
+    # @param [String, #to_str] path The POSIX or Windows path.
+    # @param [Symbol] platform Either +:posix+ or +:windows+.
+    # @param [String, Addressable::URI, #to_str, nil] base
+    #   An absolute base path or file URI, required for a relative path.
+    # @return [Addressable::URI] The encoded file URI.
+    def self.path_to_file_uri(path, *arguments)
+      path = file_string!(path)
+      _options, platform, base = file_arguments!(arguments)
+      platform = file_platform!(platform)
+
+      components = file_path_components(path, platform)
+      if components.nil?
+        unless base
+          raise InvalidFileURIError,
+            "Relative paths require an absolute #{platform} base: #{path.inspect}"
+        end
+        base_components, base_segments = file_base_components(base, platform)
+        relative_segments = encode_relative_file_segments(path, platform)
+        encoded_segments = resolve_relative_file_segments(
+          base_segments, relative_segments)
+        host = base_components[:host]
+        local = base_components[:local]
+      elsif base
+        raise InvalidFileURIError,
+          "Base paths can only be used with relative paths: #{path.inspect}"
+      else
+        encoded_segments = components[:segments]
+        host = components[:host]
+        local = components[:local]
+      end
+
+      return build_file_uri(local, host, encoded_segments)
+    end
+
+    ##
+    # Converts an RFC 8089 file URI to a local filesystem path. This method
+    # does not inspect the host platform and does not access the filesystem.
+    #
+    # See {URI.path_to_file_uri} for the supported platform-dependent range.
+    #
+    # @param [String, Addressable::URI, #to_str] uri The file URI.
+    # @param [Symbol] platform Either +:posix+ or +:windows+.
+    # @param [String, Addressable::URI, #to_str, nil] base
+    #   An absolute base path or file URI, required for a relative URI.
+    # @return [String] The decoded POSIX or Windows path.
+    def self.file_uri_to_path(uri, *arguments)
+      uri = file_string!(uri)
+      _options, platform, base = file_arguments!(arguments)
+      platform = file_platform!(platform)
+      parsed = parse(uri)
+
+      if parsed.scheme && parsed.scheme.downcase != FILE_SCHEME
+        raise InvalidFileURIError,
+          "Expected a file URI, got: #{parsed.scheme.inspect}"
+      end
+      reject_file_uri_components!(parsed)
+      drive_absolute = windows_drive_absolute_uri_path?(parsed.path, platform)
+      host, encoded_segments = file_uri_path_components(
+        parsed, uri, platform, base, drive_absolute)
+
+      decoded_segments = encoded_segments.map do |segment|
+        next segment if segment =~ /\A[A-Za-z]:\z/
+        decoded = unencode_component(segment)
+        unless decoded.valid_encoding?
+          raise InvalidFileURIError,
+            "File URI components must use valid UTF-8: #{segment.inspect}"
+        end
+        decoded
+      end
+      return file_segments_to_path(platform, host, decoded_segments)
+    end
+
+    class << self
+      alias_method :file_uri_from_path, :path_to_file_uri
+      alias_method :path_from_file_uri, :file_uri_to_path
+      alias_method :file_path_from_uri, :file_uri_to_path
+    end
+
+    class << self
+      private
+
+      def file_string!(value)
+        raise TypeError, "Can't convert nil into String." if value.nil?
+        unless value.respond_to?(:to_str)
+          raise TypeError, "Can't convert #{value.class} into String."
+        end
+        value.to_str
+      end
+
+      def file_platform!(platform)
+        platform = platform.to_sym if platform.respond_to?(:to_sym)
+        unless FILE_PLATFORMS.include?(platform)
+          raise ArgumentError,
+            "Expected platform to be :posix or :windows, got #{platform.inspect}"
+        end
+        platform
+      end
+
+      def file_arguments!(arguments)
+        options = arguments.last.is_a?(Hash) ? arguments.last : {}
+        platform = arguments.first.is_a?(Hash) ? options[:platform] : arguments[0]
+        base = options.key?(:base) ? options[:base] : arguments[1]
+        return options, platform, base
+      end
+
+      def reject_file_uri_components!(uri)
+        if uri.query != nil
+          raise InvalidFileURIError, "File URIs cannot have a query"
+        end
+        if uri.fragment != nil
+          raise InvalidFileURIError, "File URIs cannot have a fragment"
+        end
+        if uri.user != nil || uri.password != nil || uri.port != nil
+          raise InvalidFileURIError,
+            "File URIs cannot have user information or a port"
+        end
+        if uri.scheme && uri.scheme.downcase != FILE_SCHEME
+          raise InvalidFileURIError,
+            "Expected a file URI, got: #{uri.scheme.inspect}"
+        end
+      end
+
+      def build_file_uri(local, host, segments)
+        if local
+          path = segments.join(SLASH)
+          host = EMPTY_STR
+        else
+          path = SLASH + segments.join(SLASH)
+        end
+
+        return URI.new(
+          :scheme => FILE_SCHEME,
+          :host => host,
+          :path => path
+        )
+      end
+
+      def file_path_components(path, platform)
+        raise InvalidFileURIError, "Path cannot be empty" if path.empty?
+        raise InvalidFileURIError, "Path cannot contain a NUL character" if
+          path.include?("\x00")
+
+        if platform == :windows
+          windows_path_components(path)
+        else
+          return nil unless path.start_with?(SLASH)
+          {
+            :local => true,
+            :host => EMPTY_STR,
+            :segments => encode_file_path_segments(path.split(SLASH, -1), platform)
+          }
+        end
+      end
+
+      def windows_path_components(path)
+        if path =~ /\A[\/\\]{2}[.?][\/\\]/
+          raise InvalidFileURIError,
+            "Windows device paths cannot be represented reliably: #{path.inspect}"
+        end
+
+        if (match = path.match(/\A([A-Za-z])[:|](?:[\/\\]|\z)/))
+          drive = "#{match[1]}:"
+          remainder = path[match[0].length..-1] || EMPTY_STR
+          remainder = remainder.tr("\\", SLASH)
+          segments = remainder.empty? ? [EMPTY_STR] : remainder.split(SLASH, -1)
+          validate_windows_segments!(segments)
+          return {
+            :local => true,
+            :host => EMPTY_STR,
+            :segments => [EMPTY_STR, drive] +
+              encode_file_path_segments(segments, :windows)
+          }
+        end
+
+        if path =~ /\A[A-Za-z][:|]/
+          raise InvalidFileURIError,
+            "Windows drive-relative paths cannot be represented reliably: #{path.inspect}"
+        end
+
+        if (match = path.match(/\A[\/\\]{2}([^\/\\]+)[\/\\]+([^\/\\]+)([\s\S]*)\z/))
+          host = match[1]
+          share = match[2]
+          remainder = match[3]
+          remainder = remainder.tr("\\", SLASH)
+          remainder_segments = remainder.split(SLASH, -1)
+          remainder_segments = remainder_segments[1..-1] if
+            remainder_segments.first == EMPTY_STR
+          segments = [share] + remainder_segments
+          validate_windows_segments!([host] + segments)
+          return {
+            :local => false,
+            :host => encode_file_host(host),
+            :segments => encode_file_path_segments(segments, :windows)
+          }
+        end
+
+        if path =~ /\A[\/\\]{2}/
+          raise InvalidFileURIError,
+            "Windows UNC paths must include a host and share name: #{path.inspect}"
+        end
+        if path.start_with?(SLASH) || path.start_with?("\\")
+          raise InvalidFileURIError,
+            "Windows root-relative paths cannot be represented reliably: #{path.inspect}"
+        end
+
+        segments = path.split(WINDOWS_FILE_SEPARATOR, -1)
+        validate_windows_segments!(segments)
+        return nil
+      end
+
+      def validate_windows_segments!(segments)
+        segments.each do |segment|
+          if segment =~ WINDOWS_INVALID_FILE_CHARACTER
+            raise InvalidFileURIError,
+              "Windows path contains a character that cannot be represented: #{segment.inspect}"
+          end
+          if segment =~ /\A(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|\z)/i
+            raise InvalidFileURIError,
+              "Windows device paths cannot be represented reliably: #{segment.inspect}"
+          end
+        end
+      end
+
+      def encode_file_path_segments(segments, platform)
+        segments.map do |segment|
+          if segment =~ /\A[A-Za-z]:\z/
+            segment
+          else
+            encode_file_segment(segment, platform)
+          end
+        end
+      end
+
+      def encode_relative_file_segments(path, platform)
+        segments = platform == :windows ?
+          path.split(WINDOWS_FILE_SEPARATOR, -1) : path.split(SLASH, -1)
+        validate_windows_segments!(segments) if platform == :windows
+        segments.map { |segment| encode_file_segment(segment, platform) }
+      end
+
+      def encode_file_segment(segment, platform)
+        if platform == :windows && segment =~ WINDOWS_INVALID_FILE_CHARACTER
+          raise InvalidFileURIError,
+            "Windows path contains a character that cannot be represented: #{segment.inspect}"
+        end
+        encode_component(segment, CharacterClassesRegexps::PCHAR)
+      end
+
+      def encode_file_host(host)
+        if host =~ /[\x00\/\\]/
+          raise InvalidFileURIError,
+            "UNC host contains an invalid character: #{host.inspect}"
+        end
+        encode_component(host, CharacterClassesRegexps::HOST)
+      end
+
+      def file_base_components(base, platform)
+        base_string = file_string!(base)
+        if base.kind_of?(URI) || base_string =~ /\Afile:/i
+          parsed = parse(base_string)
+          if parsed.scheme && parsed.scheme.downcase != FILE_SCHEME
+            raise InvalidFileURIError,
+              "Expected a file URI base, got: #{parsed.scheme.inspect}"
+          end
+          reject_file_uri_components!(parsed)
+          components = parse_file_uri_components(parsed, platform, true)
+        else
+          components = file_path_components(base_string, platform)
+          if components.nil?
+            raise InvalidFileURIError,
+              "Base must be an absolute #{platform} path: #{base_string.inspect}"
+          end
+        end
+
+        segments = components[:segments].dup
+        segments << EMPTY_STR unless segments.last == EMPTY_STR
+        return components, segments
+      end
+
+      def file_uri_path_components(
+          parsed, original_uri, platform, base, drive_absolute)
+        relative_reference = relative_file_reference?(
+          parsed, drive_absolute)
+        if platform == :windows && parsed.path =~ /\A[A-Za-z][:|][^\/]/
+          raise InvalidFileURIError,
+            "Windows drive-relative URIs cannot be represented reliably: " +
+              original_uri.inspect
+        end
+
+        if relative_reference
+          unless base
+            raise InvalidFileURIError,
+              "Relative file URIs require an absolute #{platform} base: " +
+                original_uri.inspect
+          end
+          base_components, base_segments = file_base_components(base, platform)
+          target_segments = canonical_file_uri_segments(
+            parsed.path.split(SLASH, -1), platform)
+          encoded_segments = resolve_relative_file_segments(
+            base_segments, target_segments)
+          return base_components[:host], encoded_segments
+        elsif !parsed.path.start_with?(SLASH) && !drive_absolute
+          raise InvalidFileURIError,
+            "Rootless file URIs require a base or a Windows drive: " +
+              original_uri.inspect
+        end
+
+        components = parse_file_uri_components(parsed, platform)
+        return components[:host], components[:segments]
+      end
+
+      def relative_file_reference?(uri, drive_absolute)
+        (uri.scheme.nil? || uri.scheme.downcase == FILE_SCHEME) &&
+          uri.host.nil? && uri.port.nil? &&
+          !uri.path.start_with?(SLASH) && !drive_absolute
+      end
+
+      def resolve_relative_file_segments(base_segments, target_segments)
+        if base_segments.last == EMPTY_STR
+          resolved = base_segments[0...-1] + target_segments
+          resolved << EMPTY_STR if resolved.empty? || resolved.last != EMPTY_STR &&
+            target_segments.last == EMPTY_STR
+          resolved
+        else
+          base_segments + [EMPTY_STR] + target_segments
+        end
+      end
+
+      def parse_file_uri_components(uri, platform, allow_rootless=false)
+        host = uri.host
+        host = EMPTY_STR if host.nil?
+        host = decode_file_host(host)
+        path = uri.path.to_s
+        reject_encoded_file_separator!(path, platform)
+        path.split(SLASH, -1).each do |segment|
+          validate_file_segment_encoding!(segment)
+        end
+
+        rootless_drive = windows_drive_absolute_uri_path?(path, platform)
+        if !rootless_drive && !path.start_with?(SLASH)
+          if allow_rootless
+            raise InvalidFileURIError, "Base URI must be absolute: #{uri.to_s.inspect}"
+          end
+          return nil
+        end
+
+        if path.empty?
+          raise InvalidFileURIError, "File URI path cannot be empty"
+        end
+        if platform == :posix
+          if !LOCAL_FILE_HOSTS.include?(host)
+            raise InvalidFileURIError,
+              "Remote file URIs cannot be represented as POSIX paths: #{uri.to_s.inspect}"
+          end
+          segments = canonical_file_uri_segments(
+            path.split(SLASH, -1), platform, rootless_drive)
+          return { :local => true, :host => EMPTY_STR, :segments => segments }
+        end
+
+        windows_uri_components(host, path, rootless_drive)
+      end
+
+      def windows_uri_components(host, path, rootless_drive)
+        segments = path.split(SLASH, -1)
+        if rootless_drive
+          drive_segments = normalize_windows_drive_segments(segments)
+          drive_segments[0] = "#{drive_segments[0][0]}:"
+          segments = canonical_file_uri_segments(
+            [EMPTY_STR] + drive_segments, :windows, true)
+        elsif segments.length >= 2 && segments.first == EMPTY_STR &&
+            segments[1] =~ /\A([A-Za-z])[:|]\z/
+          segments = canonical_file_uri_segments(segments, :windows, true)
+        elsif host == EMPTY_STR
+          raise InvalidFileURIError,
+            "Windows file URIs without a drive are root-relative: #{path.inspect}"
+        else
+          if segments.length < 2 || segments[1].empty?
+            raise InvalidFileURIError,
+              "UNC file URIs must include a share name: #{path.inspect}"
+          end
+          if host =~ /\A[.?]\z/
+            raise InvalidFileURIError,
+              "Windows device paths cannot be represented reliably: #{host.inspect}"
+          end
+          return {
+            :local => false,
+            :host => host,
+            :segments => canonical_file_uri_segments(
+              segments[1..-1], :windows, false)
+          }
+        end
+
+        validate_canonical_windows_drive!(segments)
+        {
+          :local => true,
+          :host => EMPTY_STR,
+          :segments => segments
+        }
+      end
+
+      def normalize_windows_drive_segments(segments)
+        drive_index = segments.index { |segment| segment =~ /\A[A-Za-z][:|]\z/ }
+        return segments unless drive_index == 0
+        drive = segments[0]
+        rest = segments[1..-1]
+        rest = [EMPTY_STR] if rest.empty?
+        [drive] + rest
+      end
+
+      def validate_canonical_windows_drive!(segments)
+        unless segments.length >= 2 && segments[1] =~ /\A[A-Za-z]:\z/
+          raise InvalidFileURIError,
+            "Windows local file URIs must include a drive: #{segments.inspect}"
+        end
+      end
+
+      def windows_drive_absolute_uri_path?(path, platform)
+        platform == :windows &&
+          path =~ /\A[A-Za-z][:|](?:\/|\z)/
+      end
+
+      def canonical_file_uri_segments(segments, platform, drive_allowed=false)
+        segments.each_with_index.map do |segment, index|
+          if segment =~ /\A[A-Za-z]:\z/
+            segment
+          elsif platform == :windows && drive_allowed && index == 1 &&
+              segment =~ /\A([A-Za-z])\|\z/
+            "#{$1}:"
+          else
+            canonical_file_uri_segment(segment, platform, drive_allowed && index == 1)
+          end
+        end
+      end
+
+      def canonical_file_uri_segment(segment, platform, drive_allowed=false)
+        decoded = decode_file_segment(segment, platform, false)
+        if platform == :windows && !drive_allowed && decoded.include?(":")
+          raise InvalidFileURIError,
+            "Windows path contains a character that cannot be represented: #{decoded.inspect}"
+        end
+        encode_file_segment(decoded, platform)
+      end
+
+      def validate_file_segment_encoding!(segment)
+        validate_percent_encoding!(segment)
+        decoded = unencode_component(segment)
+        unless decoded.valid_encoding?
+          raise InvalidFileURIError,
+            "File URI components must use valid UTF-8: #{segment.inspect}"
+        end
+        if decoded.include?("\x00")
+          raise InvalidFileURIError, "File URIs cannot contain NUL"
+        end
+      end
+
+      def decode_file_segment(segment, platform, host)
+        validate_percent_encoding!(segment)
+        decoded = unencode_component(segment)
+        unless decoded.valid_encoding?
+          raise InvalidFileURIError,
+            "File URI components must use valid UTF-8: #{segment.inspect}"
+        end
+        if decoded.include?("\x00")
+          raise InvalidFileURIError, "File URIs cannot contain NUL"
+        end
+        if platform == :windows
+          if decoded.include?("\\") || segment.include?("\\")
+            raise InvalidFileURIError,
+              "Encoded or raw backslashes cannot separate URI paths"
+          end
+          if decoded =~ WINDOWS_INVALID_FILE_CHARACTER
+            raise InvalidFileURIError,
+              "Windows path contains a character that cannot be represented: #{decoded.inspect}"
+          end
+        end
+        decoded
+      end
+
+      def decode_file_host(host)
+        validate_percent_encoding!(host)
+        decoded = unencode_component(host)
+        unless decoded.valid_encoding?
+          raise InvalidFileURIError,
+            "File URI hosts must use valid UTF-8: #{host.inspect}"
+        end
+        if decoded =~ /[\x00\/\\]/ || host.include?("\\")
+          raise InvalidFileURIError,
+            "UNC host contains an invalid character: #{host.inspect}"
+        end
+        decoded
+      end
+
+      def validate_percent_encoding!(component)
+        component.scan(/%(?![0-9a-fA-F]{2})/) do
+          raise InvalidFileURIError,
+            "Malformed percent encoding: #{component.inspect}"
+        end
+      end
+
+      def reject_encoded_file_separator!(path, platform)
+        separators = platform == :windows ? "2F|5C" : "2F"
+        if path =~ /%(?:#{separators})(?![0-9A-Fa-f]{2})/i
+          raise InvalidFileURIError,
+            "Encoded path separators cannot introduce new directories"
+        end
+      end
+
+      def file_segments_to_path(platform, host, segments)
+        if platform == :posix
+          segments.join(SLASH)
+        elsif segments.length >= 2 && segments[0] == EMPTY_STR &&
+            segments[1] =~ /\A[A-Za-z]:\z/
+          drive = segments[1]
+          rest = segments[2..-1] || []
+          "#{drive}\\#{rest.join("\\")}"
+        else
+          "\\\\#{host}\\#{segments.join("\\")}"
+        end
+      end
     end
 
     ##
