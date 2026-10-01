@@ -17,6 +17,7 @@
 #++
 
 
+require "set"
 require "addressable/version"
 require "addressable/uri"
 
@@ -26,6 +27,7 @@ module Addressable
   # RFC 6570 (http://tools.ietf.org/html/rfc6570).
   class Template
     # Constants used throughout the template code.
+    STRICT_ENUMERATION_LIMIT = 1024
     anything =
       Addressable::URI::CharacterClasses::RESERVED +
       Addressable::URI::CharacterClasses::UNRESERVED
@@ -85,6 +87,11 @@ module Addressable
     ##
     # Raised if an invalid template operator is used in a pattern.
     class InvalidTemplateOperatorError < StandardError
+    end
+
+    ##
+    # Raised if an invalid variable type is supplied to strict extraction.
+    class InvalidTemplateVariableTypeError < ArgumentError
     end
 
     ##
@@ -228,6 +235,112 @@ module Addressable
     end
 
     ##
+    # This class represents the result of strict reverse matching.
+    class StrictMatchData
+      # Valid statuses for a strict match.
+      STATUSES = [:unique, :multiple, :no_match, :truncated].freeze
+
+      ##
+      # Creates a new StrictMatchData object.
+      # StrictMatchData objects should never be instantiated directly.
+      #
+      # @param [Addressable::URI] uri
+      #   The URI that the template was matched against.
+      # @param [Addressable::Template] template
+      #   The template used to match.
+      # @param [Array<Hash>] candidates
+      #   The variable mappings which re-expand to the URI.
+      # @param [Symbol] status
+      #   One of +:unique+, +:multiple+, +:no_match+, or +:truncated+.
+      # @param [Array<Symbol>] truncated_reasons
+      #   Reasons the result is truncated, such as +:prefix+ or
+      #   +:candidate_limit+.
+      def initialize(uri, template, candidates, status, truncated_reasons=[])
+        @uri = uri.dup.freeze
+        @template = template
+        @candidates = candidates.map { |candidate|
+          candidate.dup.freeze
+        }.freeze
+        @status = status
+        @truncated_reasons = truncated_reasons.dup.freeze
+      end
+
+      ##
+      # @return [Addressable::URI] The URI that was matched against.
+      attr_reader :uri
+
+      ##
+      # @return [Addressable::Template] The template used for matching.
+      attr_reader :template
+
+      ##
+      # @return [Array<Hash>] All candidate mappings within the configured limit.
+      attr_reader :candidates
+
+      alias_method :matches, :candidates
+
+      ##
+      # @return [Symbol] The result status.
+      attr_reader :status
+
+      ##
+      # @return [Array<Symbol>] Reasons the result was truncated.
+      attr_reader :truncated_reasons
+
+      ##
+      # @return [Hash, nil] The first candidate mapping, if one exists.
+      def mapping
+        candidates.first
+      end
+      alias_method :match, :mapping
+
+      ##
+      # @return [Boolean] Whether at least one candidate was found.
+      def match?
+        !no_match?
+      end
+
+      ##
+      # @return [Boolean] Whether exactly one candidate was found.
+      def unique?
+        status == :unique
+      end
+
+      ##
+      # @return [Boolean] Whether more than one candidate was found.
+      def multiple?
+        status == :multiple
+      end
+
+      ##
+      # @return [Boolean] Whether no candidate was found.
+      def no_match?
+        status == :no_match
+      end
+
+      ##
+      # @return [Boolean] Whether the result was truncated.
+      def truncated?
+        status == :truncated
+      end
+
+      ##
+      # @return [Boolean] Whether a prefix modifier hid information.
+      def prefix_truncated?
+        truncated_reasons.include?(:prefix)
+      end
+
+      ##
+      # @return [Boolean] Whether the candidate limit was reached.
+      def candidate_limit_truncated?
+        truncated_reasons.include?(:candidate_limit)
+      end
+    end
+
+    StrictVariable = Struct.new(:name, :explode, :prefix_length)
+    StrictExpression = Struct.new(:operator, :variables)
+
+    ##
     # Creates a new <tt>Addressable::Template</tt> object.
     #
     # @param [#to_str] pattern The URI Template pattern.
@@ -248,6 +361,7 @@ module Addressable
       self.variables
       self.variable_defaults
       self.named_captures
+      self.strict_tokens
       super
     end
 
@@ -486,6 +600,114 @@ module Addressable
     end
 
     ##
+    # Performs strict reverse matching against a URI template.
+    #
+    # @param [Addressable::URI, #to_str] uri
+    #   The URI to reverse match.
+    # @param [Hash] variable_types
+    #   Optional variable types. Values may be +:scalar+ (or +String+),
+    #   +:list+ (or +Array+), and +:map+ (or +Hash+). Variables which are
+    #   not declared are treated as scalars.
+    # @param [Integer] max_candidates
+    #   Maximum number of candidates to return. Defaults to 100.
+    #
+    # @return [Addressable::Template::StrictMatchData] The strict match result.
+    def strict_match(uri, variable_types=nil, max_candidates=100)
+      if !max_candidates.is_a?(Integer) || max_candidates < 1
+        raise ArgumentError, "max_candidates must be a positive Integer"
+      end
+
+      uri = Addressable::URI.parse(uri) unless uri.is_a?(Addressable::URI)
+      uri_string = uri.to_s
+      tokens = strict_tokens
+      variable_types = strict_variable_types(tokens, variable_types || {})
+      suffix_positions = strict_suffix_positions(tokens, uri_string)
+      suffix_positions[tokens.size] = Set.new([uri_string.length])
+      candidates = []
+      truncated_reasons = []
+      truncated_candidates = []
+      Thread.current[:addressable_template_strict_enumerations] = 0
+
+      search = lambda do |token_index, uri_index, mapping, truncated|
+        if token_index == tokens.size
+          if uri_index == uri_string.length
+            candidate = mapping.dup
+            if self.expand(candidate).to_s == uri_string &&
+                !candidates.include?(candidate)
+              candidates << candidate.freeze
+              truncated_candidates << truncated.dup
+              throw :strict_limit if candidates.size > max_candidates
+            end
+          end
+          next
+        end
+
+        token_type, token_value = tokens[token_index]
+        if token_type == :literal
+          if strict_start_at?(uri_string, token_value, uri_index)
+            search.call(
+              token_index + 1,
+              uri_index + token_value.length,
+              mapping, truncated
+            )
+          end
+        else
+          strict_expression_candidates(
+            token_value, uri_string, uri_index,
+            suffix_positions.fetch(token_index + 1, Set.new([uri_string.length])),
+            variable_types
+        ) do |consumed, local_mapping, local_truncated|
+            next_index = uri_index + consumed
+            next unless suffix_positions.fetch(token_index + 1, Set.new).include?(
+              next_index
+            )
+            merged = strict_merge_mapping(
+              mapping, local_mapping, truncated, local_truncated
+            )
+            next unless merged
+            merged_mapping, merged_truncated = merged
+            search.call(
+              token_index + 1, next_index,
+              merged_mapping, merged_truncated
+            )
+          end
+        end
+      end
+
+      catch :strict_limit do
+        search.call(0, 0, {}, Set.new)
+      end
+
+      if Thread.current[:addressable_template_strict_enumerations] >=
+          STRICT_ENUMERATION_LIMIT
+        truncated_reasons << :candidate_limit
+      elsif candidates.size > max_candidates
+        truncated_reasons << :candidate_limit
+        candidates = candidates.first(max_candidates)
+        truncated_candidates = truncated_candidates.first(max_candidates)
+      end
+      truncated_reasons << :prefix if truncated_candidates.any? { |set| !set.empty? }
+
+      status = if candidates.empty?
+        truncated_reasons.empty? ? :no_match : :truncated
+      elsif !truncated_reasons.empty?
+        :truncated
+      elsif candidates.size == 1
+        :unique
+      else
+        :multiple
+      end
+
+      Addressable::Template::StrictMatchData.new(
+        uri, self, candidates, status, truncated_reasons
+      )
+    ensure
+      Thread.current[:addressable_template_strict_enumerations] = nil
+    end
+    alias_method :strict_extract, :strict_match
+    alias_method :extract_strict, :strict_match
+
+    ##
     # Expands a URI template into another URI template.
     #
     # @param [Hash] mapping The mapping that corresponds to the pattern.
@@ -665,6 +887,598 @@ module Addressable
           end
         end
       end
+    end
+
+    def strict_tokens
+      @strict_tokens ||= begin
+        tokens = []
+        position = 0
+
+        while position < pattern.length
+          start = pattern.index("{", position)
+          unless start
+            tokens << [:literal, pattern[position..-1]] unless position == pattern.length
+            break
+          end
+
+          finish = pattern.index("}", start)
+          unless finish
+            tokens << [:literal, pattern[position..-1]]
+            break
+          end
+
+          tokens << [:literal, pattern[position...start]] unless start == position
+          match = EXPRESSION.match(pattern[start..finish])
+          unless match
+            raise InvalidTemplateValueError,
+              "Invalid URI template: #{pattern.inspect}"
+          end
+
+          operator = match[1]
+          variables = match[2].split(",").map do |varspec|
+            variable_match = VARSPEC.match(varspec)
+            name = variable_match[1]
+            modifier = variable_match[2]
+            StrictVariable.new(
+              name,
+              modifier == "*",
+              modifier && modifier.start_with?(":") ?
+                modifier[1..-1].to_i : nil
+            )
+          end
+          tokens << [:expression, StrictExpression.new(operator, variables)]
+          position = finish + 1
+        end
+
+        tokens
+      end
+    end
+
+    def strict_variable_types(tokens, declared)
+      declared = normalize_keys(declared)
+      types = {}
+
+      tokens.each do |type, value|
+        next unless type == :expression
+        value.variables.each do |variable|
+          variable_type = declared.fetch(variable.name, :scalar)
+          variable_type =
+            case variable_type
+            when :scalar, :string, String then :scalar
+            when :list, :array, Array then :list
+            when :map, :hash, Hash then :map
+            else
+              raise InvalidTemplateVariableTypeError,
+                "Unknown variable type: #{variable_type.inspect}"
+            end
+          if variable_type != :scalar && variable.prefix_length
+            raise InvalidTemplateVariableTypeError,
+              "Prefix modifiers require scalar variables: #{variable.name}"
+          end
+          if types.key?(variable.name) &&
+              types[variable.name] != variable_type
+            raise InvalidTemplateVariableTypeError,
+              "Conflicting variable types: #{variable.name}"
+          end
+          types[variable.name] = variable_type
+        end
+      end
+
+      declared.each do |name, _|
+        unless types.key?(name)
+          raise InvalidTemplateVariableTypeError,
+            "Unknown template variable: #{name.inspect}"
+        end
+      end
+
+      types
+    end
+
+    def strict_suffix_positions(tokens, uri)
+      positions = Array.new(tokens.size)
+      feasible = Set.new([uri.length])
+
+      (tokens.size - 1).step(0, -1) do |index|
+        type, value = tokens[index]
+        if type == :literal
+          starts = Set.new
+          feasible.each do |position|
+            start = position - value.length
+            if start >= 0 && strict_start_at?(uri, value, start)
+              starts.add(start)
+            end
+          end
+          feasible = starts
+        else
+          starts = feasible.dup
+          starts.add(0)
+          feasible.each do |position|
+            (0...position).each { |start| starts.add(start) }
+          end
+          feasible = starts
+        end
+        positions[index] = feasible
+      end
+
+      positions
+    end
+
+    def strict_expression_candidates(expression, uri, start, endings, types,
+                                    &block)
+      endings.sort.each do |ending|
+        next if ending < start
+        strict_enumerate!
+        raw = uri[start...ending]
+        strict_parse_variables(
+          expression.operator, expression.variables, 0, raw,
+          0, true, types, {}, Set.new, expression.variables, []
+        ) do |consumed, mapping, truncated|
+          if consumed == raw.length
+            block.call(ending - start, mapping, truncated)
+          end
+        end
+      end
+    end
+
+    def strict_parse_variables(operator, variables, index, raw, position,
+                                first_present, types, mapping, truncated,
+                                expression_variables = variables,
+                                seen_variables = [], &block)
+      if index == variables.size
+        block.call(position, mapping, truncated) if position == raw.length
+        return
+      end
+
+      name = variables[index].name
+      existing_variable = expression_variables.find {
+        |item| item.name == name
+      }
+      variable = existing_variable || variables[index]
+
+      prefix = strict_variable_prefix(
+        operator,
+        first_present, seen_variables
+      )
+      present = strict_start_at?(raw, prefix, position)
+
+      strict_assign_value(mapping, name, nil) do |without_value|
+        strict_parse_variables(
+          operator, variables, index + 1, raw, position,
+          first_present, types, without_value, truncated,
+          expression_variables, seen_variables, &block
+        )
+      end
+
+      if types[name] == :list && !mapping.key?(name) &&
+          [nil, "+", "#", ";"].include?(operator)
+        strict_assign_value(mapping, name, []) do |with_empty_list|
+          strict_parse_variables(
+            operator, variables, index + 1, raw, position,
+            first_present, types, with_empty_list, truncated,
+            expression_variables, seen_variables, &block
+          )
+        end
+      end
+
+      if types[name] == :map && !mapping.key?(name)
+        strict_assign_value(mapping, name, {}) do |with_empty_map|
+          strict_parse_variables(
+            operator, variables, index + 1, raw, position,
+            first_present, types, with_empty_map, truncated,
+            expression_variables, seen_variables, &block
+          )
+        end
+      end
+
+      return unless present
+
+      if raw.length == position + prefix.length
+        if types[name] == :map &&
+            !strict_named_operator?(operator) && operator != "#"
+          return
+        end
+        if types[name] == :list && (operator == "/" || operator == ".")
+          return
+        end
+      end
+
+      if types[name] == :list
+        empty = strict_empty_list_expansion(operator, name, first_present)
+        if strict_start_at?(raw, empty, position)
+          strict_assign_value(mapping, name, []) do |with_empty|
+            strict_parse_variables(
+              operator, variables, index + 1, raw,
+              position + empty.length, false, types, with_empty,
+              truncated, expression_variables, seen_variables, &block
+            )
+          end
+        end
+      end
+
+      body_start = position + prefix.length
+      if types[name] == :scalar
+        strict_parse_scalar_candidate(
+          variable, operator, raw, body_start, seen_variables.empty?
+        ) do |consumed, value, value_truncated|
+            strict_assign_value(mapping, name, value) do |result|
+              next_truncated = truncated.dup
+            if value_truncated &&
+                expression_variables.all? { |item|
+                  item.name == name ? !!item.prefix_length : true
+                }
+              next_truncated.add(name)
+            end
+            strict_parse_variables(
+              operator, variables, index + 1, raw, consumed,
+              false, types, result, next_truncated,
+              expression_variables,
+              seen_variables + [name], &block
+            )
+          end
+        end
+      elsif types[name] == :list
+        strict_parse_list_candidate(
+          variable, operator, raw, body_start, seen_variables.empty?
+        ) do |consumed, value|
+          strict_assign_value(mapping, name, value) do |result|
+            strict_parse_variables(
+              operator, variables, index + 1, raw, consumed,
+              false, types, result, truncated,
+              expression_variables,
+              seen_variables + [name], &block
+            )
+          end
+        end
+      else
+        strict_parse_map_candidate(
+          variable, operator, raw, body_start, seen_variables.empty?
+        ) do |consumed, value|
+          strict_assign_value(mapping, name, value) do |result|
+            strict_parse_variables(
+              operator, variables, index + 1, raw, consumed,
+              false, types, result, truncated,
+              expression_variables,
+              seen_variables + [name], &block
+            )
+          end
+        end
+      end
+    end
+
+    def strict_parse_scalar_candidate(variable, operator, raw, position,
+                                     first_present)
+      strict_candidate_bodies(
+        raw, position, strict_external_delimiter(operator)
+      ) do |body, boundary|
+        if strict_named_operator?(operator)
+          value = strict_named_value(name: variable.name, body: body,
+                                   operator: operator)
+          next unless value
+        else
+          value = strict_decode(body)
+        end
+
+        is_truncated = !!variable.prefix_length &&
+          variable.prefix_length <= value.length &&
+          boundary == raw.length
+        if variable.prefix_length
+          value = value[0...variable.prefix_length] || value
+        end
+        yield boundary, value, is_truncated
+      end
+    end
+
+    def strict_parse_list_candidate(variable, operator, raw, position,
+                                   first_present)
+      strict_candidate_bodies(
+        raw, position, strict_external_delimiter(operator)
+      ) do |body, boundary|
+        strict_list_values(variable, operator, body) do |values|
+          yield boundary, values
+        end
+      end
+    end
+
+    def strict_parse_map_candidate(variable, operator, raw, position,
+                                  first_present)
+      strict_candidate_bodies(
+        raw, position, strict_external_delimiter(operator)
+      ) do |body, boundary|
+        if strict_named_operator?(operator) && !variable.explode
+          body = strict_named_value(name: variable.name, body: body,
+                                   operator: operator)
+          next unless body
+        end
+
+      if variable.explode
+        separator = strict_internal_separator(operator)
+        parts = body.split(separator, -1)
+        strict_each_partition(parts, separator) do |groups|
+          valid = groups.all? do |group|
+            if operator == ";" && !group.include?("=")
+              true
+            elsif group.include?("=")
+              positions = strict_equals_positions(group, operator)
+              !positions.empty?
+            else
+              false
+            end
+          end
+          next unless valid
+
+          mappings = [{}]
+          groups.each do |group|
+            mappings = strict_append_map_group(
+              mappings, group, operator
+            )
+          end
+          mappings.each { |mapping| yield boundary, mapping }
+        end
+      else
+        parts = body.split(",", -1)
+        if operator == "+" || operator == "#"
+          strict_each_partition(parts, ",") do |groups|
+            next unless groups.size.even? && !groups.empty?
+            mapping = {}
+            groups.each_slice(2) do |key, value|
+              mapping[strict_decode(key)] = strict_decode(value)
+            end
+            yield boundary, mapping
+          end
+        else
+          next if parts.empty? || parts.size.odd?
+          mapping = {}
+          parts.each_slice(2) do |key, value|
+            mapping[strict_decode(key)] = strict_decode(value)
+          end
+          yield boundary, mapping
+        end
+      end
+      end
+    end
+
+    def strict_candidate_bodies(raw, position, delimiter)
+      boundaries = [raw.length]
+      if delimiter
+        search_position = position
+        while search_position <= raw.length &&
+            found = raw.index(delimiter, search_position)
+          boundaries << found
+          search_position = found + 1
+        end
+      end
+
+      boundaries.sort.uniq.each do |boundary|
+        next if boundary < position
+        yield raw[position...boundary], boundary
+      end
+    end
+
+    def strict_list_values(variable, operator, body)
+      separator = variable.explode ?
+        strict_internal_separator(operator) : ","
+      parts = body.split(separator, -1)
+
+      if strict_named_operator?(operator) && variable.explode
+        prefix = "#{variable.name}="
+        unless parts.all? { |part| part.start_with?(prefix) }
+          return
+        end
+        parts.map! { |part| part[prefix.length..-1] }
+      elsif strict_named_operator?(operator)
+        unless body.start_with?("#{variable.name}=") || body.empty?
+          return
+        end
+        body = body[(variable.name.length + 1)..-1] if body
+        parts = body.to_s.split(",", -1)
+        parts = [] if body.nil? || body.empty?
+      end
+
+      ambiguous = variable.explode ? operator == "." :
+        operator == "+" || operator == "#"
+      if ambiguous
+        strict_each_partition(parts, separator) do |groups|
+          yield groups.map { |group| strict_decode(group) }
+        end
+      else
+        yield parts.map { |part| strict_decode(part) }
+      end
+    end
+
+    def strict_exploded_map_pairs(group, operator)
+      if operator == ";" && !group.include?("=")
+        yield [strict_decode(group), ""]
+      elsif group.include?("=")
+        strict_equals_positions(group, operator).each do |equals|
+          yield [
+            strict_decode(group[0...equals]),
+            strict_decode(group[(equals + 1)..-1])
+          ]
+        end
+      end
+    end
+
+    def strict_equals_positions(group, operator)
+      positions = []
+      search_position = 0
+      while search_position < group.length &&
+          found = group.index("=", search_position)
+        positions << found
+        search_position = found + 1
+      end
+      if operator != "+" && operator != "#" && !positions.empty?
+        positions = [positions.first]
+      end
+      positions
+    end
+
+    def strict_append_map_group(mappings, group, operator)
+      next_mappings = []
+      mappings.each do |mapping|
+        strict_exploded_map_pairs(group, operator) do |pair|
+          unless mapping.key?(pair[0])
+            next_mapping = mapping.dup
+            next_mapping[pair[0]] = pair[1]
+            next_mappings << next_mapping
+          end
+        end
+      end
+      next_mappings
+    end
+
+    def strict_each_partition(parts, separator = ",")
+      if parts.empty?
+        yield []
+        return
+      end
+
+      partition = Array.new(parts.size - 1, false)
+      loop do
+        groups = []
+        current = parts.first
+        partition.each_with_index do |split, index|
+          if split
+            groups << current
+            current = parts[index + 1]
+          else
+            current += separator + parts[index + 1]
+          end
+        end
+        groups << current
+        strict_enumerate!
+        yield groups
+
+        index = partition.rindex(false)
+        break unless index
+        partition[index] = true
+        (index + 1...partition.size).each { |i| partition[i] = false }
+      end
+    end
+
+    def strict_named_value(name:, body:, operator:)
+      if operator == ";"
+        return "" if body == name
+        prefix = "#{name}="
+        return body[prefix.length..-1] if body.start_with?(prefix)
+      elsif body.start_with?("#{name}=")
+        return body[(name.length + 1)..-1]
+      end
+      nil
+    end
+
+    def strict_decode(value)
+      Addressable::URI.unencode_component(value).unicode_normalize(:nfc)
+    end
+
+    def strict_enumerate!
+      count = (Thread.current[:addressable_template_strict_enumerations] || 0) + 1
+      Thread.current[:addressable_template_strict_enumerations] = count
+      throw :strict_limit if count > STRICT_ENUMERATION_LIMIT
+    end
+
+    def strict_start_at?(string, prefix, position)
+      position >= 0 && string[position, prefix.length] == prefix
+    end
+
+    def strict_assign_value(mapping, name, value)
+      if mapping.key?(name) && mapping[name] != value
+        nil
+      else
+        result = mapping.dup
+        result[name] = value
+        if block_given?
+          yield result
+        else
+          result
+        end
+      end
+    end
+
+    def strict_variable_prefix(operator, first_present, seen_variables)
+      if first_present
+        LEADERS.fetch(operator, "")
+      else
+        seen_variables.empty? ? LEADERS.fetch(operator, "") :
+          (operator == "?" ? JOINERS[operator] :
+            LEADERS.fetch(operator, JOINERS.fetch(operator, ",")))
+      end
+    end
+
+    def strict_external_delimiter(operator)
+      case operator
+      when nil, "+", "#" then ","
+      else JOINERS[operator]
+      end
+    end
+
+    def strict_internal_separator(operator)
+      case operator
+      when nil, "+", "#" then ","
+      else JOINERS[operator]
+      end
+    end
+
+    def strict_named_operator?(operator)
+      operator == ";" || operator == "?" || operator == "&"
+    end
+
+    def strict_empty_list_expansion(operator, name, first_present)
+      case operator
+      when nil, "+"
+        first_present ? "" : ","
+      when "#"
+        first_present ? "#" : ","
+      when "/", "."
+        (first_present ? "" : strict_external_delimiter(operator)) +
+          LEADERS[operator]
+      when ";"
+        (first_present ? "" : ";") + ";#{name}"
+      when "?", "&"
+        (first_present ? LEADERS[operator] : "&") +
+          "#{name}="
+      end
+    end
+
+    def strict_merge_mapping(mapping, local_mapping, _truncated, _local)
+      result = mapping.dup
+      truncated = _truncated.dup
+      resolved_names = Set.new
+      local_mapping.each do |name, value|
+        if result.key?(name) && result[name] != value
+          local_truncated = _local.include?(name)
+          previous_truncated = _truncated.include?(name)
+          return nil unless local_truncated || previous_truncated
+          if local_truncated && !previous_truncated
+            prefix = value
+            full = result[name]
+          else
+            prefix = result[name]
+            full = value
+          end
+          return nil unless full.is_a?(String) && prefix.is_a?(String) &&
+            full.start_with?(prefix)
+          result[name] = full
+          truncated.delete(name) if !local_truncated || !previous_truncated
+          resolved_names.add(name)
+          next
+        end
+        result[name] = value
+      end
+      _local.each do |name|
+        truncated.add(name) unless resolved_names.include?(name)
+      end
+      [result, truncated]
+    end
+
+    def strict_prefix_truncated?(tokens, mapping, name)
+      value = mapping[name]
+      return false unless value.is_a?(String)
+      occurrences = tokens.flat_map do |type, expression|
+        next [] unless type == :expression
+        expression.variables.select { |variable| variable.name == name }
+      end
+      occurrences.all? { |variable| variable.prefix_length } &&
+        occurrences.any? { |variable| variable.prefix_length < value.length }
     end
 
 

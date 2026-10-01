@@ -701,6 +701,207 @@ describe Addressable::Template do
     end
   end
 
+  describe "strict_match" do
+    it "reports multiple adjacent scalar candidates" do
+      result = Addressable::Template.new("{x}{y}").strict_match("ab")
+
+      expect(result).to be_multiple
+      expect(result.candidates).to eq([
+        {"x" => nil, "y" => "ab"},
+        {"x" => "", "y" => "ab"},
+        {"x" => "a", "y" => "b"},
+        {"x" => "ab", "y" => nil},
+        {"x" => "ab", "y" => ""}
+      ])
+    end
+
+    it "recognizes scalar, list, and map declarations" do
+      scalar = Addressable::Template.new("{+x}").strict_match("a/b", {
+        "x" => :scalar
+      })
+      list = Addressable::Template.new("{/x*}").strict_match("/a/b", {
+        "x" => :list
+      })
+      map = Addressable::Template.new("{?x*}").strict_match("?a=1&b=2", {
+        "x" => :map
+      })
+
+      expect(scalar.mapping).to eq("x" => "a/b")
+      expect(list.mapping).to eq("x" => %w(a b))
+      expect(map.mapping).to eq("x" => {"a" => "1", "b" => "2"})
+    end
+
+    it "treats absent composites and empty composites as distinct candidates" do
+      result = Addressable::Template.new("{x}").strict_match("", {
+        "x" => :map
+      })
+
+      expect(result).to be_multiple
+      expect(result.candidates).to eq([
+        {"x" => nil},
+        {"x" => {}}
+      ])
+    end
+
+    it "supports RFC 6570 operators with explode" do
+      templates = {
+        "/" => "/a/b/c",
+        "." => ".a.b.c",
+        ";" => ";x=a;x=b;x=c",
+        "?" => "?x=a&x=b&x=c",
+        "&" => "&x=a&x=b&x=c"
+      }
+
+      templates.each do |operator, uri|
+        result = Addressable::Template.new("{#{operator}x*}").strict_match(
+          uri, "x" => :list
+        )
+        if operator == "."
+          expect(result).to be_multiple
+          expect(result.candidates).to include("x" => %w(a b c))
+        else
+          expect(result).to be_unique
+          expect(result.mapping).to eq("x" => %w(a b c))
+        end
+      end
+    end
+
+    it "reports ambiguity hidden by extract around empty values" do
+      ordinary = Addressable::Template.new("{#x}{+y}").extract("#")
+      strict = Addressable::Template.new("{#x}{+y}").strict_match("#")
+
+      expect(ordinary).to eq("x" => nil, "y" => "#")
+      expect(strict).to be_multiple
+      expect(strict.candidates).to include(
+        {"x" => nil, "y" => "#"},
+        {"x" => "", "y" => nil},
+        {"x" => "", "y" => ""}
+      )
+    end
+
+    it "reports ambiguity hidden by extract around reserved characters" do
+      ordinary = Addressable::Template.new("{#x}{#y}").extract("#a/b,c")
+      strict = Addressable::Template.new("{#x}{#y}").strict_match("#a/b,c")
+
+      expect(ordinary).to eq("x" => nil, "y" => "a/b,c")
+      expect(strict).to be_multiple
+      expect(strict.candidates).to include(
+        {"x" => nil, "y" => "a/b,c"},
+        {"x" => "a/b,c", "y" => nil}
+      )
+    end
+
+    it "reports ambiguity for separators inside reserved-component lists" do
+      result = Addressable::Template.new("{.x*}").strict_match(".a.b.c", {
+        "x" => :list
+      })
+
+      expect(result).to be_multiple
+      expect(result.candidates).to include(
+        {"x" => ["a.b.c"]},
+        {"x" => ["a.b", "c"]},
+        {"x" => ["a", "b.c"]},
+        {"x" => ["a", "b", "c"]}
+      )
+    end
+
+    it "reports ambiguity for equals inside reserved-component maps" do
+      result = Addressable::Template.new("{+x*}").strict_match("a=1=b", {
+        "x" => :map
+      })
+
+      expect(result).to be_multiple
+      expect(result.candidates).to eq([
+        {"x" => {"a" => "1=b"}},
+        {"x" => {"a=1" => "b"}}
+      ])
+    end
+
+    it "rejects values that do not match declared types" do
+      result = Addressable::Template.new("{/x*}").strict_match("/a/b", {
+        "x" => :scalar
+      })
+
+      expect(result).to be_no_match
+    end
+
+    it "enforces repeated variables" do
+      matching = Addressable::Template.new("{x}{x}").strict_match("abab")
+      conflicting = Addressable::Template.new("{x}{x}").strict_match("ab")
+
+      expect(matching).to be_unique
+      expect(matching.mapping).to eq("x" => "ab")
+      expect(conflicting).to be_no_match
+    end
+
+    it "enforces repeated variables within one expression" do
+      result = Addressable::Template.new("{x,x}").strict_match("a,a")
+
+      expect(result).to be_unique
+      expect(result.mapping).to eq("x" => "a")
+    end
+
+    it "reports truncated prefix information" do
+      result = Addressable::Template.new("{x:1}{y}").strict_match("abc")
+
+      expect(result).to be_truncated
+      expect(result).to be_prefix_truncated
+      expect(result.candidates).to include(
+        {"x" => nil, "y" => "abc"},
+        {"x" => "", "y" => "abc"},
+        {"x" => "a", "y" => "bc"}
+      )
+    end
+
+    it "truncates candidate enumeration at the configured limit" do
+      result = Addressable::Template.new("{x}{y}").strict_match("abc", {}, 2)
+
+      expect(result).to be_truncated
+      expect(result).to be_candidate_limit_truncated
+      expect(result.candidates.size).to eq(2)
+      expect(result.truncated_reasons).to include(:candidate_limit)
+    end
+
+    it "reports truncation even if no candidate survives the limit" do
+      result = Addressable::Template.new("{+x*}").strict_match(
+        (("a," * 1100) + "!"), "x" => :map
+      )
+
+      expect(result).to be_truncated
+      expect(result).to be_candidate_limit_truncated
+    end
+
+    it "returns candidates that re-expand to the original URI" do
+      result = Addressable::Template.new("{?x*}").strict_match("?a=1&b=2", {
+        "x" => :map
+      })
+
+      result.candidates.each do |candidate|
+        expect(
+          Addressable::Template.new("{?x*}").expand(candidate).to_s
+        ).to eq("?a=1&b=2")
+      end
+    end
+
+    it "validates candidate limits and variable declarations" do
+      expect {
+        Addressable::Template.new("{x}").strict_match("x", {}, 0)
+      }.to raise_error(ArgumentError)
+
+      expect {
+        Addressable::Template.new("{x}").strict_match("x", "x" => :unknown)
+      }.to raise_error(Addressable::Template::InvalidTemplateVariableTypeError)
+
+      expect {
+        Addressable::Template.new("{x}").strict_match("x", "y" => :scalar)
+      }.to raise_error(Addressable::Template::InvalidTemplateVariableTypeError)
+
+      expect {
+        Addressable::Template.new("{x:1}").strict_match("x", "x" => :list)
+      }.to raise_error(Addressable::Template::InvalidTemplateVariableTypeError)
+    end
+  end
+
   describe "Partial expand with symbols" do
     context "partial_expand with two simple values" do
       subject {

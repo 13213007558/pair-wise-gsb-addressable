@@ -86,6 +86,20 @@ template.extract(uri)
 #   "two" => "2",
 #   "fragment" => "foo"
 # }
+
+result = template.strict_match(uri, {
+  "host" => :scalar,
+  "segments" => :list,
+  "one" => :scalar,
+  "two" => :scalar,
+  "bogus" => :scalar,
+  "fragment" => :scalar
+})
+result.unique?       #=> true
+result.candidates     #=> [{"host" => "example.com", ...}]
+
+Addressable::Template.new("{x}{y}").strict_match("ab").multiple?
+#=> true
 ```
 
 ## Install

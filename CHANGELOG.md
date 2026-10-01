@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+- Add strict URI template reverse matching with typed variables, candidate
+  enumeration, and truncation reporting
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)
