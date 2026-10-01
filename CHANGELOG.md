@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+- Add `Addressable::URN`, an RFC 8141 URN implementation, with dedicated
+  accessors for the NID, NSS, r-component, q-component and f-component;
+  lexical equivalence comparison (`lexically_equivalent?` /
+  `same_resource?`); minimal normalization for unknown namespaces and
+  per-namespace normalization rules via `register_namespace`.
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)

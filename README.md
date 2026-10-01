@@ -23,11 +23,13 @@ Addressable is an alternative implementation to the URI implementation
 that is part of Ruby's standard library. It is flexible, offers heuristic
 parsing, and additionally provides extensive support for IRIs and URI templates.
 
-Addressable closely conforms to RFC 3986, RFC 3987, and RFC 6570 (level 4).
+Addressable closely conforms to RFC 3986, RFC 3987, RFC 6570 (level 4),
+and RFC 8141 (URNs).
 
 ## Reference
 
 - {Addressable::URI}
+- {Addressable::URN}
 - {Addressable::Template}
 
 ## Example usage
@@ -46,6 +48,45 @@ uri.path
 uri = Addressable::URI.parse("http://www.詹姆斯.com/")
 uri.normalize
 #=> #<Addressable::URI:0xc9a4c8 URI:http://www.xn--8ws00zhy3a.com/>
+```
+
+
+## URNs (RFC 8141)
+
+`Addressable::URN` is a subclass of `Addressable::URI`, so the generic
+accessors (`path`, `query`, `fragment`) keep working, while dedicated
+accessors expose the URN structure: `nid`, `nss`, `r_component`,
+`q_component` and `f_component`.
+
+```ruby
+require "addressable/urn"
+
+urn = Addressable::URN.parse("urn:isbn:0451450523?+resolver?=q#section-2")
+urn.nid          #=> "isbn"
+urn.nss          #=> "0451450523"
+urn.r_component  #=> "resolver"   (introduced by "?+")
+urn.q_component  #=> "q"          (introduced by "?=")
+urn.f_component  #=> "section-2"
+urn.path         #=> "isbn:0451450523" (generic URI view)
+urn.query        #=> "?+resolver?=q"  (generic URI view)
+```
+
+The r/q/f-components are not part of the resource identity; use
+`lexically_equivalent?` (aliased as `same_resource?`) to compare URNs
+without them.  Normalization lowercases the scheme and NID and upcases
+percent-encoding hex digits, but never lowercases the NSS.  Per-namespace
+normalization rules can be registered, and unknown namespaces receive only
+the minimal processing allowed by RFC 8141:
+
+```ruby
+Addressable::URN.register_namespace("isbn") { |u| u.nss.delete("-") }
+Addressable::URN.parse("urn:ISBN:0-451-45052-3").normalize.to_s
+#=> "urn:isbn:0451450523"
+
+a = Addressable::URN.parse("urn:example:a%2Fb")
+b = Addressable::URN.parse("urn:EXAMPLE:a%2fb?=q#f")
+a.same_resource?(b)  #=> true
+a == b               #=> false (different r/q/f-components)
 ```
 
 
