@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+- adds Addressable::DataURI, an RFC 2397 data URI implementation with
+  incremental payload decoding from chunked input, strict validation,
+  decoded size limits, and selectable percent/base64 serialization
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)

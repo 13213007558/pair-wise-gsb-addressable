@@ -29,6 +29,7 @@ Addressable closely conforms to RFC 3986, RFC 3987, and RFC 6570 (level 4).
 
 - {Addressable::URI}
 - {Addressable::Template}
+- {Addressable::DataURI}
 
 ## Example usage
 
@@ -48,6 +49,30 @@ uri.normalize
 #=> #<Addressable::URI:0xc9a4c8 URI:http://www.xn--8ws00zhy3a.com/>
 ```
 
+
+## Data URIs
+
+For more details, see [RFC 2397](https://www.rfc-editor.org/rfc/rfc2397.txt).
+
+```ruby
+require "addressable/data_uri"
+
+uri = Addressable::DataURI.parse("data:image/png;base64,iVBORw0KGgo=")
+uri.media_type
+#=> "image/png"
+uri.base64?
+#=> true
+uri.data
+#=> "\x89PNG\r\n\x1A\n"
+
+# Payloads can also be decoded incrementally from any IO-like source
+# into any IO-like sink, with an optional decoded size limit:
+Addressable::DataURI.decode_stream(source, sink, base64: true, limit: 1_048_576)
+
+# Serialization can use either percent-encoding or base64:
+uri.to_s(base64: false)
+#=> "data:image/png,%89PNG%0D%0A%1A%0A"
+```
 
 ## URI Templates
 
