@@ -35,6 +35,16 @@ module Addressable
     end
 
     ##
+    # Raised when a data URI contains invalid media type or encoded data.
+    class InvalidDataURIError < InvalidURIError
+    end
+
+    ##
+    # Raised when decoded data exceeds a caller supplied size limit.
+    class DataURITooLargeError < InvalidDataURIError
+    end
+
+    ##
     # Container for the character classes specified in
     # <a href="http://www.ietf.org/rfc/rfc3986.txt">RFC 3986</a>.
     #
@@ -131,6 +141,8 @@ module Addressable
       rescue TypeError, NoMethodError
         raise TypeError, "Can't convert #{uri.class} into String."
       end unless uri.is_a?(String)
+
+      return Data.parse(uri) if uri =~ /\Adata:/i
 
       # This Regexp supplied as an example in RFC 3986, and it works great.
       scan = uri.scan(URIREGEX)
@@ -2420,6 +2432,762 @@ module Addressable
         instance_variable_set("@#{key}", value)
       end
       nil
+    end
+
+    ##
+    # Represents an RFC 2397 data URI.
+    class Data < URI
+      DEFAULT_MEDIA_TYPE = "text/plain".freeze
+      DEFAULT_CHARSET = "US-ASCII".freeze
+
+      MIME_TYPE_PATTERN = '\A[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*(?:\/[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*)?\z'
+      TOKEN_PATTERN = '\A[a-zA-Z0-9!#$%&\'*+\-.^_`|~]+\z'
+      MIME_TYPE_REGEXP = /#{MIME_TYPE_PATTERN}/.freeze
+      TOKEN_REGEXP = /#{TOKEN_PATTERN}/.freeze
+      HEADER_CHAR_REGEXP = /\A[\x20-\x7e]*\z/.freeze
+      PAYLOAD_CHAR_REGEXP = /\A[\x21-\x3b\x3d-\x7e]*\z/.freeze
+      UNRESERVED_CHARACTERS = (
+        ("A".."Z").to_a + ("a".."z").to_a +
+        ("0".."9").to_a + ["-", ".", "_", "~"]
+      ).freeze
+      BASE64_VALUES = {}
+      ("A".."Z").each_with_index { |character, index| BASE64_VALUES[character] = index }
+      ("a".."z").each_with_index { |character, index| BASE64_VALUES[character] = index + 26 }
+      ("0".."9").each_with_index { |character, index| BASE64_VALUES[character] = index + 52 }
+      BASE64_VALUES["+"] = 62
+      BASE64_VALUES["/"] = 63
+      BASE64_VALUES.freeze
+      class << self
+        def parse(uri)
+          if uri.is_a?(self)
+            return uri.dup
+          elsif !uri.respond_to?(:to_str)
+            raise TypeError, "Can't convert #{uri.class} into String."
+          end
+          uri = uri.to_str
+          unless uri.ascii_only? && uri =~ /\Adata:/i
+            raise InvalidDataURIError, "Invalid non-ASCII character in data URI."
+          end
+
+          comma = data_comma_index(uri)
+          raise InvalidDataURIError, "Missing comma in data URI." unless comma
+          raise InvalidDataURIError, "Invalid fragment in data URI." if uri.include?('#')
+          header = uri.byteslice(5, comma - 5).to_s
+          parsed = parse_header(header)
+
+          data_uri = allocate
+          data_uri.send(
+            :initialize_data,
+            :media_type => parsed[:media_type],
+            :parameters => parsed[:parameters],
+            :base64 => parsed[:base64],
+            :default_media_type => parsed[:default_media_type],
+            :encoded_uri => uri,
+            :payload_offset => comma + 1
+          )
+          data_uri
+        end
+
+        def new(*args)
+          options = args.last
+          if args.empty?
+            options = {}
+          elsif !(options.is_a?(Hash) || options.is_a?(Symbol))
+            raise ArgumentError, "Cannot create an Addressable::URI without options."
+          end
+          if options.is_a?(Symbol) || args.length > 1
+            media_type, parameters = args
+            options = {
+              :media_type => media_type,
+              :parameters => parameters
+            }
+          else
+            options = options.dup
+          end
+
+          if options.key?(:path) && !options.key?(:encoded_data) && !options.key?(:data)
+            path = options[:path]
+            path = path.to_str unless path.nil?
+            return parse("data:#{path}")
+          end
+
+          data_uri = allocate
+          data_uri.send(:initialize_data, options)
+          data_uri
+        end
+
+        def decode(input, output=nil, max_bytes: nil, &block)
+          if input.is_a?(Data)
+            input.decode(output, :max_bytes => max_bytes, &block)
+          elsif input.is_a?(String)
+            Decoder.decode(Source.new(input), output, :max_bytes => max_bytes, &block)
+          else
+            Decoder.decode(Source.new(input), output, :max_bytes => max_bytes, &block)
+          end
+        end
+
+        private
+
+        def data_comma_index(uri)
+          quoted = false
+          escaped = false
+          uri.each_char.with_index do |character, index|
+            next if index < 5
+            if quoted
+              if escaped
+                escaped = false
+              elsif character == "\\"
+                escaped = true
+              elsif character == '"'
+                quoted = false
+              end
+            elsif character == ','
+              return index
+            elsif character == '"'
+              quoted = true
+            end
+          end
+          nil
+        end
+
+        def parse_header(header)
+          unless header =~ HEADER_CHAR_REGEXP
+            raise InvalidDataURIError, "Invalid character in data URI media type."
+          end
+
+          return default_header if header.empty?
+
+          segments = split_header_segments(header)
+          base64 = segments.last == "base64"
+          segments = segments[0...-1] if base64
+          media_type = nil
+          parameters = {}
+
+          segments.each_with_index do |segment, index|
+            if index == 0
+              if segment.empty?
+                raise InvalidDataURIError, "Invalid media type." if
+                  segments.length == 1 && !base64
+              else
+                media_type = strict_unencode(segment)
+                unless media_type =~ MIME_TYPE_REGEXP
+                  raise InvalidDataURIError, "Invalid media type: #{segment.inspect}."
+                end
+              end
+            elsif segment.empty?
+              raise InvalidDataURIError, "Invalid media type parameter."
+            else
+              key, value = segment.split('=', 2)
+              raise InvalidDataURIError, "Invalid media type parameter." if value.nil?
+              key = strict_unencode(key)
+              unless key =~ TOKEN_REGEXP
+                raise InvalidDataURIError, "Invalid media type parameter name."
+              end
+              value = parse_parameter_value(value)
+              parameters[key.downcase] = value
+            end
+          end
+
+          default_media_type = apply_defaults(media_type, parameters)
+          media_type ||= DEFAULT_MEDIA_TYPE
+
+          {
+            :media_type => media_type,
+            :parameters => parameters.freeze,
+            :base64 => base64,
+            :default_media_type => default_media_type
+          }
+        end
+
+        def default_header
+          {
+            :media_type => DEFAULT_MEDIA_TYPE,
+            :parameters => {"charset" => DEFAULT_CHARSET}.freeze,
+            :base64 => false,
+            :default_media_type => true
+          }
+        end
+
+        def apply_defaults(media_type, parameters)
+          if media_type.nil?
+            media_type = DEFAULT_MEDIA_TYPE
+            parameters["charset"] ||= DEFAULT_CHARSET
+            return true
+          elsif media_type.downcase == DEFAULT_MEDIA_TYPE && !parameters.key?("charset")
+            parameters["charset"] = DEFAULT_CHARSET
+          end
+          false
+        end
+
+        def split_header_segments(header)
+          segments = []
+          current = String.new
+          quoted = false
+          escaped = false
+          header.each_char do |character|
+            if quoted
+              current << character
+              if escaped
+                escaped = false
+              elsif character == "\\"
+                escaped = true
+              elsif character == '"'
+                quoted = false
+              end
+            elsif character == ';'
+              segments << current
+              current = String.new
+            else
+              quoted = character == '"'
+              current << character
+            end
+          end
+          segments << current
+          segments
+        end
+
+        def parse_parameter_value(value)
+          if value.start_with?('"')
+            unless value =~ /\A"(?:[^"\\]|\\.)*"\z/
+              raise InvalidDataURIError, "Invalid quoted media type parameter."
+            end
+            value = value[1...-1].gsub(/\\(.)/, '\\1')
+          elsif value !~ TOKEN_REGEXP
+            raise InvalidDataURIError, "Invalid media type parameter value."
+          end
+          strict_unencode(value).force_encoding(Encoding::ASCII_8BIT)
+        end
+
+        def strict_unencode(value)
+          result = String.new
+          index = 0
+          while index < value.bytesize
+            byte = value.getbyte(index)
+            if byte == 37
+              sequence = value.byteslice(index, 3)
+              unless sequence =~ /\A%[0-9a-fA-F]{2}\z/
+                raise InvalidDataURIError, "Invalid percent encoding in data URI."
+              end
+              result << sequence[1, 2].to_i(16)
+              index += 3
+            else
+              result << byte
+              index += 1
+            end
+          end
+          result
+        end
+      end
+
+      attr_reader :media_type, :parameters, :base64
+
+      def path
+        @uri_string.byteslice(
+          5, @uri_string.bytesize - 5
+        ).force_encoding(Encoding::ASCII_8BIT)
+      end
+
+      def base64?
+        @base64
+      end
+
+      def content_type
+        header_without_base64
+      end
+
+      def raw_data
+        encoded_data
+      end
+
+      def encoded_data
+        @uri_string.byteslice(
+          @payload_offset, @uri_string.bytesize - @payload_offset
+        ).dup.force_encoding(Encoding::ASCII_8BIT)
+      end
+
+      def data(max_bytes: nil)
+        decode(nil, :max_bytes => max_bytes)
+      end
+
+      def decode(output=nil, max_bytes: nil, &block)
+        Decoder.decode_payload(
+          Source.new(@uri_string, @payload_offset), @base64, output,
+          :max_bytes => max_bytes, &block
+        )
+      end
+
+      def to_s(representation=nil)
+        return super() if representation.nil?
+        case representation.to_s
+        when "percent", "percent-encoded"
+          transcode(false)
+        when "base64"
+          transcode(true)
+        else
+          raise ArgumentError, "Unknown data URI representation."
+        end
+      end
+
+      def freeze
+        @media_type.freeze
+        @parameters.freeze
+        super
+      end
+
+      private
+
+      def initialize_data(options)
+        encoded_uri = options[:encoded_uri]
+        if encoded_uri
+          reset_ivs
+          @scheme = "data"
+          @media_type = options[:media_type]
+          @parameters = options[:parameters]
+          @base64 = options[:base64]
+          @default_media_type = options.fetch(:default_media_type, false)
+          @payload_offset = options[:payload_offset]
+          @uri_string = encoded_uri
+          payload = encoded_uri.byteslice(
+            @payload_offset, encoded_uri.bytesize - @payload_offset
+          ).to_s
+          send(:validate_encoded_data, payload, @base64)
+          return
+        end
+
+        media_type = options[:media_type]
+        parameters = options[:parameters] || {}
+        base64 = options[:base64]
+        data = options[:data]
+        encoded_data = options[:encoded_data]
+
+        if data && encoded_data
+          raise ArgumentError, "Cannot specify both data and encoded_data."
+        end
+        unless parameters.respond_to?(:each_pair)
+          raise TypeError, "Can't convert #{parameters.class} into Hash."
+        end
+
+        parameters = parameters.each_with_object({}) do |(key, value), result|
+          key = key.is_a?(Symbol) ? key.to_s : key.to_str
+          value = value.to_str
+          result[key.downcase] = value.dup
+        end
+
+        if media_type.nil?
+          media_type = DEFAULT_MEDIA_TYPE
+          default_media_type = true
+          parameters["charset"] ||= DEFAULT_CHARSET
+        else
+          media_type = media_type.to_str
+          unless media_type =~ MIME_TYPE_REGEXP
+            raise InvalidDataURIError, "Invalid media type: #{media_type.inspect}."
+          end
+          default_media_type = false
+          if media_type.downcase == DEFAULT_MEDIA_TYPE && !parameters.key?("charset")
+            parameters["charset"] = DEFAULT_CHARSET
+          end
+        end
+
+        if data
+          unless data.respond_to?(:to_str)
+            raise TypeError, "Can't convert #{data.class} into String."
+          end
+          data = data.to_str.dup.force_encoding(Encoding::ASCII_8BIT)
+          encoded_data = base64 ? encode_base64(data) : encode_percent(data)
+        elsif encoded_data
+          unless encoded_data.respond_to?(:to_str)
+            raise TypeError, "Can't convert #{encoded_data.class} into String."
+          end
+          encoded_data = encoded_data.to_str.dup.force_encoding(Encoding::ASCII_8BIT)
+        else
+          encoded_data = String.new
+        end
+
+        reset_ivs
+        @scheme = "data"
+        @media_type = media_type
+        @parameters = parameters
+        @base64 = !!base64
+        @default_media_type = default_media_type
+        header = build_header
+        @payload_offset = 5 + header.bytesize + 1
+        @uri_string = "data:" + header + "," + encoded_data
+
+        send(:validate_encoded_data, encoded_data, @base64)
+      end
+
+      def build_header
+        parts = []
+        parts << @media_type unless @default_media_type
+        @parameters.each do |key, value|
+          if @default_media_type && key.downcase == "charset" && value == DEFAULT_CHARSET
+            next
+          end
+          parts << "#{key}=#{serialize_parameter_value(value)}"
+        end
+        parts << "base64" if @base64
+        return ";#{parts.join(";")}" if @default_media_type && parts.any?
+        parts.join(";")
+      end
+
+      def header_without_base64
+        parts = []
+        parts << @media_type
+        @parameters.each do |key, value|
+          parts << "#{key}=#{serialize_parameter_value(value)}"
+        end
+        parts.join(";")
+      end
+
+      def serialize_parameter_value(value)
+        if value =~ TOKEN_REGEXP
+          value
+        else
+          escaped = value.gsub("\\", "\\\\").gsub('"', '\\"')
+          '"' + escaped + '"'
+        end
+      end
+
+      def transcode(base64)
+        encoded = String.new
+        decode do |chunk, decoder|
+          encoded << (base64 ? encode_base64(chunk) : encode_percent(chunk))
+        end
+        header = String.new
+        header << @media_type unless @default_media_type
+        @parameters.each do |key, value|
+          if @default_media_type && key == "charset" && value == DEFAULT_CHARSET
+            next
+          end
+          header << ";" unless header.empty?
+          header << "#{key}=#{serialize_parameter_value(value)}"
+        end
+        header << ";base64" if base64
+        header = ";#{header}" if @default_media_type && !header.empty? && header[0] != ';'
+        "data:#{header},#{encoded}"
+      end
+
+      def encode_percent(data)
+        data.bytes.map do |byte|
+          if UNRESERVED_CHARACTERS.include?(byte.chr)
+            byte.chr
+          else
+            format("%%%02X", byte)
+          end
+        end.join
+      end
+
+      def encode_base64(data)
+        [data].pack("m0")
+      end
+
+      def validate_encoded_data(encoded_data, base64)
+        unless encoded_data =~ PAYLOAD_CHAR_REGEXP
+          raise InvalidDataURIError, "Invalid character in data URI payload."
+        end
+        Decoder.decode_payload(
+          Source.new(encoded_data), base64, NullOutput.new
+        )
+      end
+
+      class NullOutput
+        def write(chunk)
+          chunk.bytesize
+        end
+      end
+
+      class Source
+        def initialize(input, offset=0)
+          if input.is_a?(String)
+            @string = input
+            @offset = offset
+          elsif input.respond_to?(:read)
+            @io = input
+            @buffer = String.new
+            @buffer_offset = 0
+            @eof = false
+          else
+            @chunks = input.each
+            @buffer = String.new
+            @buffer_offset = 0
+            @eof = false
+          end
+        end
+
+        def read_byte
+          if @string
+            return nil if @offset >= @string.bytesize
+            byte = @string.getbyte(@offset)
+            @offset += 1
+            byte
+          else
+            fill_buffer if @buffer_offset >= @buffer.bytesize
+            return nil if @buffer_offset >= @buffer.bytesize
+            byte = @buffer.getbyte(@buffer_offset)
+            @buffer_offset += 1
+            byte
+          end
+        end
+
+        def each_chunk
+          if @string
+            return if @offset >= @string.bytesize
+            chunk = @string.byteslice(@offset, @string.bytesize - @offset)
+            @offset = @string.bytesize
+            yield chunk
+          else
+            if @buffer && @buffer_offset < @buffer.bytesize
+              chunk = @buffer.byteslice(
+                @buffer_offset, @buffer.bytesize - @buffer_offset
+              )
+              @buffer_offset = @buffer.bytesize
+              yield chunk
+            end
+
+            if @io
+              until @eof
+                chunk = @io.read(4096)
+                if chunk.nil? || chunk.empty?
+                  @eof = true
+                else
+                  yield chunk.dup.force_encoding(Encoding::ASCII_8BIT)
+                end
+              end
+            else
+              until @eof
+                begin
+                  chunk = @chunks.next
+                rescue StopIteration
+                  @eof = true
+                end
+                break if @eof
+                yield chunk.dup.force_encoding(Encoding::ASCII_8BIT)
+              end
+            end
+          end
+        end
+
+        private
+
+        def fill_buffer
+          @buffer = String.new
+          @buffer_offset = 0
+
+          if @io
+            @buffer = @io.read(4096) || @buffer
+            @buffer.force_encoding(Encoding::ASCII_8BIT)
+            @eof = true if @buffer.empty?
+          else
+            begin
+              @buffer = @chunks.next.to_str.dup.force_encoding(Encoding::ASCII_8BIT)
+            rescue StopIteration, NoMethodError
+              @eof = true
+            end
+          end
+        end
+      end
+
+      class Decoder
+        attr_reader :media_type, :parameters, :base64
+
+        def self.decode_payload(source, base64, output=nil, max_bytes: nil, &block)
+          decoder = allocate
+          decoder.send(
+            :initialize_payload, source, base64, max_bytes
+          )
+          decoder.send(:decode, output, &block)
+        end
+
+        def initialize(source)
+          @source = source
+          @decoded_size = 0
+          @pending = String.new
+          @base64_buffer = String.new
+          @base64_padding = 0
+          @base64_finished = false
+          @chunk_output = String.new
+          read_header
+        end
+
+        def self.decode(source, output=nil, max_bytes: nil, &block)
+          decoder = new(source)
+          decoder.max_bytes = max_bytes
+          decoder.decode(output, &block)
+        end
+
+        def decode(output=nil, &block)
+          result = output || String.new
+          flush = lambda do
+            unless @chunk_output.empty?
+              result.write(@chunk_output) if result.respond_to?(:write)
+              result << @chunk_output unless result.respond_to?(:write)
+              block.call(@chunk_output, self) if block
+            end
+          end
+          @source.each_chunk do |chunk|
+            @chunk_output = String.new
+            if @base64
+              decode_base64_chunk(chunk)
+            else
+              decode_percent_chunk(chunk)
+            end
+            flush.call
+          end
+          @chunk_output = String.new
+          finish
+          flush.call
+          output ? @decoded_size : result.force_encoding(Encoding::ASCII_8BIT)
+        end
+
+        attr_writer :max_bytes
+
+        private
+
+        def initialize_payload(source, base64, max_bytes)
+          @source = source
+          @decoded_size = 0
+          @pending = String.new
+          @base64_buffer = String.new
+          @base64_padding = 0
+          @base64_finished = false
+          @chunk_output = String.new
+          @base64 = base64
+          @max_bytes = max_bytes
+          @media_type = nil
+          @parameters = nil
+        end
+
+        def read_header
+          prefix = String.new
+          5.times do
+            byte = @source.read_byte
+            raise InvalidDataURIError, "Invalid data URI prefix." unless byte
+            prefix << byte
+          end
+          raise InvalidDataURIError, "Invalid data URI prefix." unless prefix =~ /\Adata:/i
+
+          header = String.new
+          quoted = false
+          escaped = false
+          loop do
+            byte = @source.read_byte
+            raise InvalidDataURIError, "Missing comma in data URI." unless byte
+            character = byte.chr
+            if quoted
+              header << character
+              if escaped
+                escaped = false
+              elsif character == "\\"
+                escaped = true
+              elsif character == '"'
+                quoted = false
+              end
+            elsif character == ','
+              break
+            else
+              quoted = character == '"'
+              header << character
+            end
+          end
+
+          parsed = Data.send(:parse_header, header)
+          @media_type = parsed[:media_type]
+          @parameters = parsed[:parameters]
+          @base64 = parsed[:base64]
+        end
+
+        def decode_percent_chunk(chunk)
+          @chunk_output = String.new
+          chunk.each_char do |character|
+            if @pending.empty? && character != '%'
+              validate_payload_character(character)
+              write_byte(character.ord)
+            else
+              @pending << character
+              if @pending.bytesize == 3
+                if @pending !~ /\A%[0-9a-fA-F]{2}\z/
+                  raise InvalidDataURIError, "Invalid percent encoding in data URI."
+                end
+                write_byte(@pending[1, 2].to_i(16))
+                @pending = String.new
+              end
+            end
+          end
+        end
+
+        def decode_base64_chunk(chunk)
+          raise InvalidDataURIError, "Invalid base64 encoding in data URI." if @base64_finished
+          chunk.each_char do |character|
+            if character == '='
+              @base64_padding += 1
+              raise InvalidDataURIError, "Invalid base64 padding in data URI." if @base64_padding > 2
+              next
+            end
+            raise InvalidDataURIError, "Invalid base64 encoding in data URI." if @base64_padding > 0
+            unless BASE64_VALUES.key?(character)
+              raise InvalidDataURIError, "Invalid base64 encoding in data URI."
+            end
+            @base64_buffer << character
+            decode_base64_quad if @base64_buffer.bytesize == 4 && @base64_padding == 0
+          end
+        end
+
+        def finish
+          unless @pending.empty?
+            raise InvalidDataURIError, "Incomplete percent encoding in data URI."
+          end
+          if @base64
+            if @base64_padding > 0
+              decode_padded_quad
+            elsif !@base64_buffer.empty?
+              raise InvalidDataURIError, "Incomplete base64 encoding in data URI."
+            end
+          end
+        end
+
+        def decode_padded_quad
+          raise InvalidDataURIError, "Incomplete base64 encoding in data URI." unless
+            @base64_buffer.bytesize + @base64_padding == 4
+          @base64_buffer << "A" * @base64_padding
+          values = @base64_buffer.each_char.map do |character|
+            BASE64_VALUES.fetch(character)
+          end
+          if @base64_padding == 1
+            write_byte((values[0] << 2) | (values[1] >> 4))
+            write_byte(((values[1] & 15) << 4) | (values[2] >> 2))
+            raise InvalidDataURIError, "Invalid base64 encoding in data URI." if values[2] & 3 != 0
+          else
+            write_byte((values[0] << 2) | (values[1] >> 4))
+            raise InvalidDataURIError, "Invalid base64 encoding in data URI." if values[1] & 15 != 0
+          end
+          @base64_buffer = String.new
+          @base64_finished = true
+        end
+
+        def decode_base64_quad
+          values = @base64_buffer.each_char.map do |character|
+            BASE64_VALUES.fetch(character)
+          end
+          write_byte((values[0] << 2) | (values[1] >> 4))
+          write_byte(((values[1] & 15) << 4) | (values[2] >> 2))
+          write_byte(((values[2] & 3) << 6) | values[3])
+          @base64_buffer = String.new
+        end
+
+        def validate_payload_character(character)
+          unless character =~ /\A[\x21-\x3b\x3d-\x7e]\z/
+            raise InvalidDataURIError, "Invalid character in data URI payload."
+          end
+        end
+
+        def write_byte(byte)
+          if @max_bytes && @decoded_size >= @max_bytes
+            raise DataURITooLargeError, "Decoded data exceeds size limit."
+          end
+          @decoded_size += 1
+          @chunk_output << byte.chr(Encoding::ASCII_8BIT)
+        end
+      end
     end
 
   protected
