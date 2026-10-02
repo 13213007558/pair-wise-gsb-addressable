@@ -2152,6 +2152,167 @@ module Addressable
     end
 
     ##
+    # Returns the shortest reference, measured in UTF-8 bytes, that resolves
+    # to the supplied URI when joined with this URI as the base. Both this
+    # URI and the supplied URI are normalized before the reference is
+    # computed, so the result satisfies:
+    #
+    #   base.normalize.join(base.shortest_reference_to(target)) == target
+    #
+    # The candidate references considered are, in the fixed order used to
+    # break ties between references of equal byte length:
+    #
+    # 1. the empty reference (<code>""</code>), which inherits every
+    #    component from the base,
+    # 2. a fragment-only reference (<code>"#fragment"</code>),
+    # 3. a query-only reference (<code>"?query"</code>), including a bare
+    #    <code>"?"</code> when the target clears the base's query,
+    # 4. a relative-path reference (<code>"../path"</code>),
+    # 5. an absolute-path reference (<code>"/path"</code>),
+    # 6. a network-path reference (<code>"//host/path"</code>),
+    # 7. the absolute URI itself (<code>"scheme://host/path"</code>).
+    #
+    # Path segments are compared in their percent-encoded form, so an
+    # encoded slash (<code>%2F</code>) is never mistaken for a path
+    # separator. References that would be misinterpreted are never emitted:
+    # a relative path whose first segment contains a colon is prefixed with
+    # <code>"./"</code>, and a path that would begin with <code>"//"</code>
+    # is prefixed with <code>"./"</code> or <code>"/."</code> so it is not
+    # parsed as a network-path reference.
+    #
+    # @param [String, Addressable::URI, #to_str] uri The target URI.
+    #
+    # @return [Addressable::URI]
+    #   The shortest reference that resolves to the supplied URI.
+    def shortest_reference_to(uri)
+      base = self.normalize
+      target = URI.parse(uri).normalize
+      if base.relative?
+        raise ArgumentError, "Expected absolute base URI, got: #{self.to_s}"
+      end
+      if target.relative?
+        raise ArgumentError, "Expected absolute URI, got: #{uri.to_s}"
+      end
+
+      same_scheme = target.scheme == base.scheme
+      same_authority = target.authority == base.authority
+      same_origin = same_scheme && same_authority
+      same_path = target.path == base.path
+      same_query = target.query == base.query
+      fragment_suffix =
+        target.fragment != nil ? "##{target.fragment}" : EMPTY_STR.dup
+      query_suffix =
+        target.query != nil ? "?#{target.query}" : EMPTY_STR.dup
+
+      # Candidates are appended in the documented tie-breaking order.
+      candidates = []
+
+      # 1. The empty reference inherits every component from the base.
+      candidates << EMPTY_STR.dup if base == target
+
+      # 2. A fragment-only reference inherits the path and query.
+      if same_origin && same_path && same_query &&
+          target.fragment != nil && target.fragment != base.fragment
+        candidates << "##{target.fragment}"
+      end
+
+      # 3. A query-only reference replaces (or clears) the query.
+      if same_origin && same_path && !same_query
+        candidates << "?#{target.query}#{fragment_suffix}"
+      end
+
+      # 4. A relative-path reference.
+      if same_origin && !same_path && !target.path.to_s.empty?
+        base_dir = base.path.to_s.dup
+        if base_dir.include?(SLASH)
+          base_dir.sub!(/\/[^\/]*$/, SLASH)
+        else
+          base_dir = EMPTY_STR.dup
+        end
+        if base_dir.empty? && base.authority != nil
+          base_dir = SLASH.dup
+        end
+
+        dir_segments = base_dir.split(SLASH, -1)
+        dir_segments.pop
+        target_segments = target.path.split(SLASH, -1)
+        common = 0
+        while common < dir_segments.length &&
+            common < target_segments.length - 1 &&
+            dir_segments[common] == target_segments[common]
+          common += 1
+        end
+        relative_segments =
+          (dir_segments[common..-1] || []).map { PARENT } +
+          target_segments[common..-1]
+        relative_path = relative_segments.join(SLASH)
+        if relative_path.empty? && common > 0
+          # The target is the base's own directory. Back out of the last
+          # directory segment so the reference is not empty, which would
+          # inherit the base's path instead.
+          common -= 1
+          relative_segments =
+            (dir_segments[common..-1] || []).map { PARENT } +
+            target_segments[common..-1]
+          relative_path = relative_segments.join(SLASH)
+        end
+        if !relative_path.empty?
+          # A reference must not begin with "//" or it would be parsed as
+          # a network-path reference.
+          if relative_path.start_with?(SLASH)
+            relative_path = "./#{relative_path}"
+          end
+          # A colon in the first segment would be parsed as a scheme.
+          first_segment = relative_path.split(SLASH, 2).first
+          if first_segment.include?(":")
+            relative_path = "./#{relative_path}"
+          end
+          candidates << "#{relative_path}#{query_suffix}#{fragment_suffix}"
+        end
+      end
+
+      # 5. An absolute-path reference.
+      if same_origin && target.path.to_s.start_with?(SLASH)
+        absolute_path = target.path.dup
+        if absolute_path.start_with?(SLASH + SLASH)
+          absolute_path = "/.#{absolute_path}"
+        end
+        candidates << "#{absolute_path}#{query_suffix}#{fragment_suffix}"
+      end
+
+      # 6. A network-path reference.
+      if same_scheme && target.authority != nil
+        candidates <<
+          "//#{target.authority}#{target.path}#{query_suffix}#{fragment_suffix}"
+      end
+
+      # 7. The absolute URI itself always works.
+      candidates << target.to_s
+
+      best = candidates.each_with_index.select do |candidate, _|
+        base.join(candidate) == target
+      end.min_by do |candidate, index|
+        [candidate.bytesize, index]
+      end
+      return URI.parse(best.first)
+    end
+
+    ##
+    # Returns the shortest reference, measured in UTF-8 bytes, that resolves
+    # to this URI when joined with the supplied URI as the base. This is
+    # effectively the opposite of <code>shortest_reference_to</code>.
+    #
+    # @param [String, Addressable::URI, #to_str] uri The base URI.
+    #
+    # @return [Addressable::URI]
+    #   The shortest reference that resolves to this URI.
+    #
+    # @see Addressable::URI#shortest_reference_to
+    def shortest_reference_from(uri)
+      return URI.parse(uri).shortest_reference_to(self)
+    end
+
+    ##
     # Returns a normalized URI object.
     #
     # NOTE: This method does not attempt to fully conform to specifications.
