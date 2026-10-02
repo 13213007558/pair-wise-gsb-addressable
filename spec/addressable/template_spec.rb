@@ -624,6 +624,164 @@ describe Addressable::Template do
     end
   end
 
+  describe "reverse_expand" do
+    def reverse(pattern, uri, types, max_candidates=nil)
+      Addressable::Template.new(pattern).reverse_expand(
+        uri, types, max_candidates
+      )
+    end
+
+    it "reverses scalar, list, hash, and explode expansions" do
+      cases = [
+        ["{x}", "simple", {"x" => "simple"}, x: :string],
+        ["{+x}", "a,b/c?d=e", {"x" => "a,b/c?d=e"}, x: :string],
+        ["{x}", "red,green", {"x" => %w(red green)}, x: :list],
+        ["{/x*}", "/red/green", {"x" => %w(red green)}, x: :list],
+        ["{?x*}", "?red=1&green=2",
+         {"x" => {"red" => "1", "green" => "2"}}, x: :hash],
+        ["{;x*}", ";red=1;green=2",
+         {"x" => {"red" => "1", "green" => "2"}}, x: :hash],
+        ["{x}", "red,1,green,2",
+         {"x" => {"red" => "1", "green" => "2"}}, x: :hash]
+      ]
+
+      cases.each do |pattern, uri, mapping, types|
+        result = reverse(pattern, uri, types)
+        expect(result.status).to eq(:unique)
+        expect(result.candidate).to eq(mapping)
+        expect(Addressable::Template.new(pattern).expand(mapping).to_s).
+          to eq(uri)
+      end
+    end
+
+    it "does not split percent-encoded separators" do
+      result = reverse(
+        "{x*}", "a%2Cb,c%3Dd", x: :list
+      )
+      expect(result.candidate).to eq("x" => ["a,b", "c=d"])
+
+      result = reverse("{?x*}", "?a=b%26c%3Dd&e=%3D", x: :hash)
+      expect(result.candidate).to eq(
+        "x" => {"a" => "b&c=d", "e" => "="}
+      )
+      expect(reverse("{x*}", "a%252Cb,c", x: :list).candidate).
+        to eq("x" => ["a%2Cb", "c"])
+      expect(reverse("{x}", "%zz", x: :string).status).to eq(:no_solution)
+    end
+
+    it "returns provable list and hash candidates for shared output" do
+      result = reverse("{x}", "a,b", x: [:list, :hash])
+      expect(result.status).to eq(:ambiguous)
+      expect(result.candidates).to eq([
+        {"x" => %w(a b)},
+        {"x" => {"a" => "b"}}
+      ])
+      result.candidates.each do |candidate|
+        expect(Addressable::Template.new("{x}").expand(candidate).to_s).
+          to eq("a,b")
+      end
+    end
+
+    it "explains adjacent variable ambiguity" do
+      result = reverse("{x}{y}", "abc", x: :string, y: :string)
+      expect(result.status).to eq(:ambiguous)
+      expect(result.reasons).to include(:adjacent_variables)
+      expect(result.candidates).to include(
+        {"x" => "a", "y" => "bc"},
+        {"x" => "ab", "y" => "c"}
+      )
+      result.candidates.each do |candidate|
+        expect(Addressable::Template.new("{x}{y}").expand(candidate).to_s).
+          to eq("abc")
+      end
+    end
+
+    it "explains prefix truncation without choosing an unknown suffix" do
+      result = reverse("{x:2}", "ab", x: :string)
+      expect(result.status).to eq(:prefix_truncation)
+      expect(result.candidate).to eq("x" => "ab")
+      expect(result.reasons).to include(:prefix_truncation)
+    end
+
+    it "reports duplicate hash keys as impossible" do
+      result = reverse("{?x*}", "?a=1&a=2", x: :hash)
+      expect(result.status).to eq(:no_solution)
+      expect(result.candidates).to be_empty
+      expect(result.reasons).to include(:duplicate_key)
+    end
+
+    it "returns all empty-value and omission candidates" do
+      result = reverse("{#x}", "#", x: [:string, :list])
+      expect(result.status).to eq(:ambiguous)
+      expect(result.reasons).to include(:empty_value)
+      expect(result.candidates).to eq([
+        {"x" => ""},
+        {"x" => [""]}
+      ])
+      result.candidates.each do |candidate|
+        expect(Addressable::Template.new("{#x}").expand(candidate).to_s).
+          to eq("#")
+      end
+    end
+
+    it "returns empty-hash and omission candidates when outputs coincide" do
+      result = reverse("/x{?a}", "/x", a: :hash)
+      expect(result.status).to eq(:ambiguous)
+      expect(result.reasons).to include(:empty_value)
+      expect(result.candidates).to eq([
+        {"a" => nil},
+        {"a" => {}}
+      ])
+      result.candidates.each do |candidate|
+        expect(Addressable::Template.new("/x{?a}").expand(candidate).to_s).
+          to eq("/x")
+      end
+    end
+
+    it "distinguishes no solution from an unexhausted search" do
+      template = "{x}{y}"
+      no_solution = reverse(
+        template, "a/b", x: :string, y: :string
+      )
+      expect(no_solution.status).to eq(:no_solution)
+      expect(no_solution.limit_reached?).to eq(false)
+
+      limited = reverse(
+        template, "ab", {x: :string, y: :string}, 1
+      )
+      expect(limited.status).to eq(:limit_reached)
+      expect(limited.limit_reached?).to eq(true)
+      expect(limited.candidates.size).to eq(1)
+      expect(limited.complete?).to eq(false)
+    end
+
+    it "accepts symbol and string type declarations" do
+      expect(reverse("{x}", "a", x: :string).candidate).
+        to eq("x" => "a")
+      expect(reverse("{x}", "a", "x" => "string").candidate).
+        to eq("x" => "a")
+    end
+    it "accepts all scalar RFC 6570 operators with explode" do
+      [nil, "+", "#", ".", "/", ";", "?", "&"].each do |operator|
+        pattern = "{#{operator}x*}"
+        uri = Addressable::Template.new(pattern).expand(x: "a,b").to_s
+        result = reverse(pattern, uri, x: :string)
+        expect(result.candidate).to eq("x" => "a,b")
+      end
+    end
+
+    it "rejects unknown variables and invalid types" do
+      expect { reverse("{x}", "a", y: :string) }.to raise_error(ArgumentError)
+      expect { reverse("{x}", "a", x: :number) }.to raise_error(ArgumentError)
+    end
+
+    it "validates the candidate limit" do
+      expect do
+        reverse("{x}", "a", {x: :string}, 0)
+      end.to raise_error(ArgumentError)
+    end
+  end
+
   describe 'match' do
     subject { Addressable::Template.new('http://example.com/first/second/') }
     context 'when the URI is the same as the template' do

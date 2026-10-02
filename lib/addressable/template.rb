@@ -19,6 +19,7 @@
 
 require "addressable/version"
 require "addressable/uri"
+require "set"
 
 module Addressable
   ##
@@ -90,6 +91,123 @@ module Addressable
     ##
     # Raised if an invalid template operator is used in a pattern.
     class TemplateOperatorAbortedError < StandardError
+    end
+
+    ##
+    # This class represents the result of a type-aware reverse expansion.
+    class ReverseExpansion
+      include Enumerable
+
+      ##
+      # @api private
+      def initialize(uri, template, candidates, complete, limit_reached, reasons)
+        @uri = uri.dup.freeze
+        @template = template
+        @candidates = candidates.each { |candidate| candidate.freeze }.freeze
+        @complete = complete
+        @limit_reached = limit_reached
+        @reasons = reasons.to_a.uniq.freeze
+      end
+
+      # @return [Addressable::URI] The URI that was reverse expanded.
+      attr_reader :uri
+
+      # @return [Addressable::Template] The template used for the search.
+      attr_reader :template
+
+      # @return [Array<Hash>] Every mapping found before the candidate limit.
+      attr_reader :candidates
+
+      # @return [Array<Symbol>] Machine-readable explanations, including
+      #   `:adjacent_variables`, `:prefix_truncation`, `:empty_value`, and
+      #   `:duplicate_key`.
+      attr_reader :reasons
+
+      def each(&block)
+        candidates.each(&block)
+      end
+
+      # @return [Hash, nil] The only candidate, or nil when ambiguous.
+      def candidate
+        if unique?
+          candidates.first
+        elsif prefix_truncation?
+          candidates.find { |candidate| candidate.values.include?("") } ||
+            candidates.first
+        end
+      end
+
+      # @return [Boolean] Whether at least one candidate was found.
+      def match?
+        !candidates.empty?
+      end
+
+      # @return [Boolean] Whether exactly one candidate was found.
+      def unique?
+        candidates.size == 1
+      end
+
+      # @return [Boolean] Whether no candidate was found.
+      def no_solution?
+        candidates.empty?
+      end
+
+      # @return [Boolean] Whether more than one candidate was found.
+      def ambiguous?
+        prefix_truncation? || candidates.size > 1
+      end
+
+      def prefix_truncation?
+        reasons.include?(:prefix_truncation)
+      end
+
+      # @return [Boolean] Whether the search exhausted all candidates.
+      def complete?
+        @complete
+      end
+
+      # @return [Boolean] Whether the candidate limit stopped enumeration.
+      def limit_reached?
+        @limit_reached && !reasons.include?(:prefix_truncation)
+      end
+
+      # @return [Symbol] The result state.
+      def status
+        return :limit_reached if candidates.empty? && !complete?
+        return :no_solution if candidates.empty?
+        return :prefix_truncation if prefix_truncation?
+        return :limit_reached unless complete?
+        return :unique if candidates.size == 1
+        :ambiguous
+      end
+
+      # @return [String] A short explanation of the result.
+      def message
+        case status
+        when :no_solution
+          "No mapping expands to the supplied URI."
+        when :prefix_truncation
+          "Prefix expansion discards information; the displayed candidate " +
+            "is one of infinitely many mappings."
+        when :unique
+          "Found one mapping."
+        when :limit_reached
+          "Found #{candidates.size} candidate(s); enumeration was stopped " +
+            "before all candidates were expanded."
+        else
+          "Found #{candidates.size} mappings that expand to the supplied URI."
+        end
+      end
+
+      # @return [Hash, nil] The only candidate, or nil when ambiguous.
+      def to_h
+        candidate
+      end
+
+      def inspect
+        "#<#{self.class} status=#{status.inspect} " +
+          "candidates=#{candidates.inspect}>"
+      end
     end
 
     ##
@@ -344,6 +462,36 @@ module Addressable
     def extract(uri, processor=nil)
       match_data = self.match(uri, processor)
       return (match_data ? match_data.mapping : nil)
+    end
+
+    ##
+    # Reverse-expands a URI using declared variable types. Every returned
+    # mapping is verified by expanding it with this template and comparing
+    # the result to `uri`.
+    #
+    # Types are `:string`, `:list`, and `:hash`; an Array may be used to
+    # request more than one possible type. A variable declared as both list
+    # and hash can reveal representations shared by those two types.
+    # Result states are `:unique`, `:ambiguous`, `:prefix_truncation`,
+    # `:limit_reached`, and `:no_solution`.
+    #
+    # @param [Addressable::URI, #to_str] uri The URI to reverse-expand.
+    # @param [Hash] types Variable names to allowed types.
+    # @param [Integer, nil] max_candidates
+    #   Optional limit on verified mappings. `nil` exhausts the search.
+    #
+    # @return [Addressable::Template::ReverseExpansion]
+    def reverse_expand(uri, types, max_candidates=nil)
+      unless max_candidates.nil? ||
+          (max_candidates.is_a?(Integer) && max_candidates > 0)
+        raise ArgumentError, "max_candidates must be a positive Integer."
+      end
+      uri = Addressable::URI.parse(uri) unless uri.is_a?(Addressable::URI)
+      type_map = normalize_reverse_types(types)
+      search = ReverseCandidateSearch.new(
+        self, uri.to_str, type_map, max_candidates
+      )
+      search.run
     end
 
     ##
@@ -655,6 +803,866 @@ module Addressable
     end
 
   private
+    def normalize_reverse_types(types)
+      unless types.is_a?(Hash)
+        raise TypeError, "Expected a Hash of variable type declarations."
+      end
+
+      type_map = {}
+      types.each do |name, allowed_types|
+        name = name.to_s if Symbol === name
+        unless name.respond_to?(:to_str)
+          raise TypeError, "Can't convert #{name.class} into String."
+        end
+        name = name.to_str
+        unless variables.include?(name)
+          raise ArgumentError, "Unknown template variable: #{name.inspect}."
+        end
+
+        allowed = Array(allowed_types).map do |type|
+          type = type.to_s if Symbol === type
+          unless %w(string list hash).include?(type)
+            raise ArgumentError,
+              "Invalid type #{type.inspect} for #{name.inspect}. " +
+              "Valid types are :string, :list, and :hash."
+          end
+          type
+        end.uniq
+
+        if type_map.key?(name) && type_map[name] != allowed
+          raise ArgumentError,
+            "Conflicting type declarations for #{name.inspect}."
+        end
+        type_map[name] = allowed
+      end
+
+      variables.each do |name|
+        type_map[name] ||= ["string"]
+      end
+      type_map
+    end
+
+    class ReverseCandidateSearch
+      UNASSIGNED = Object.new.freeze
+
+      def initialize(template, uri, types, max_candidates)
+        @template = template
+        @uri = uri
+        @types = types
+        @max_candidates = max_candidates
+        @variable_names = template.variables
+        @tokens = build_tokens
+        @candidates = []
+        @reasons = []
+        @complete = true
+        @stopped_by_limit = false
+      end
+
+      def run
+        values = Array.new(@variable_names.size) { UNASSIGNED }
+        search_tokens(@tokens, 0, 0, values, Set.new)
+        if @candidates.size > 1 &&
+           @candidates.combination(2).any? do |left, right|
+             empty_value_ambiguity?(left, right)
+           end
+          @reasons << :empty_value
+        end
+        ReverseExpansion.new(
+          Addressable::URI.parse(@uri),
+          @template,
+          @candidates,
+          @complete,
+          @stopped_by_limit,
+          @reasons
+        )
+      end
+
+      private
+      def empty_value_ambiguity?(left, right)
+        keys = left.keys | right.keys
+        keys.any? do |key|
+          left_empty = empty_value?(left.fetch(key, nil))
+          right_empty = empty_value?(right.fetch(key, nil))
+          left_empty != right_empty ||
+            (left_empty && right_empty && left[key] != right[key])
+        end
+      end
+
+      def empty_value?(value)
+        value.nil? || value == "" || value == [] || value == {}
+      end
+
+      def build_tokens
+        tokens = []
+        position = 0
+        match = EXPRESSION.match(@template.pattern, position)
+        while match
+          unless match.begin(0) == position
+            tokens << [:literal, @template.pattern[position...match.begin(0)]]
+          end
+          _, operator, varlist = *match
+          specs = varlist.split(",").map do |varspec|
+            spec_match = VARSPEC.match(varspec)
+            {
+              name: spec_match[1],
+              modifier: spec_match[2],
+              types: @types[spec_match[1]]
+            }
+          end
+          tokens << [:expression, operator, specs]
+          position = match.end(0)
+          match = EXPRESSION.match(@template.pattern, position)
+        end
+        if position < @template.pattern.size
+          tokens << [:literal, @template.pattern[position..-1]]
+        end
+        tokens
+      end
+
+      def search_tokens(tokens, index, position, values,
+                        candidate_reasons)
+        return if @stopped_by_limit
+
+        if index >= tokens.size
+          if position == @uri.size
+            candidate_reasons = candidate_reasons + adjacent_reasons(tokens)
+            emit_candidate(values, candidate_reasons)
+          end
+          return
+        end
+
+        token = tokens[index]
+        if token.first == :literal
+          literal = token.last
+          if percent_encoding_equal?(@uri[position, literal.size], literal)
+            search_tokens(
+              tokens, index + 1, position + literal.size,
+              values, candidate_reasons
+            )
+          end
+          return
+        end
+
+        operator = token[1]
+        specs = token[2]
+        leader = LEADERS.fetch(operator, "")
+
+        parse_omitted_expression(
+          tokens, index, position, operator, specs,
+          values, candidate_reasons
+        )
+
+        unless leader.empty?
+          if @uri[position, leader.size] == leader
+          parse_present_expression(
+              tokens, index, position + leader.size, true,
+              operator, specs, values, candidate_reasons
+            )
+          end
+        else
+          parse_present_expression(
+              tokens, index, position, false, operator, specs,
+              values, candidate_reasons
+          )
+        end
+      end
+
+      def adjacent_reasons(tokens)
+        tokens.each_cons(2).any? do |left, right|
+          left.first == :expression && right.first == :expression &&
+            (left[1].nil? || left[1] == "+") &&
+            (right[1].nil? || right[1] == "+")
+        end ? [:adjacent_variables] : []
+      end
+
+      def parse_omitted_expression(tokens, index, position, operator,
+                                   specs, values, candidate_reasons)
+        next_reasons = candidate_reasons
+
+        enumerate_absent_specs(specs, 0, values) do |assigned_values|
+          adjacent_ambiguity = false
+          if operator.nil? || operator == "+"
+            next_token = tokens[index + 1]
+            if next_token && next_token.first == :expression &&
+               (next_token[1].nil? || next_token[1] == "+")
+              adjacent_ambiguity = true
+            end
+          end
+          following_reasons =
+            adjacent_ambiguity ? [:adjacent_variables] : []
+          search_tokens(
+             tokens, index + 1, position, assigned_values,
+             next_reasons + following_reasons
+          )
+        end
+      end
+
+      def enumerate_absent_specs(specs, spec_index, values)
+        if spec_index >= specs.size
+          yield values
+          return
+        end
+
+        spec = specs[spec_index]
+        absent_values(spec).each do |value|
+          result = assign_value(values, spec, value)
+          next unless result
+          next_values, _ = result
+          enumerate_absent_specs(
+            specs, spec_index + 1, next_values
+          ) { |assigned| yield assigned }
+        end
+      end
+
+      def absent_values(spec)
+        if spec[:types].include?("hash")
+          [nil, {}]
+        else
+          [nil]
+        end
+      end
+
+      def parse_present_expression(tokens, index, body_start, leader_present,
+                                   operator,
+                                   specs, values, candidate_reasons)
+        minimum_end = next_literal_start(tokens, index + 1, body_start)
+        return if minimum_end.nil?
+        maximum_end = last_literal_start(tokens, index + 1, minimum_end)
+        (body_start..maximum_end).each do |body_end|
+          parse_specs(
+            specs, 0, body_start, body_end, true,
+            operator, leader_present, tokens, index, values,
+            candidate_reasons
+          )
+          return if @stopped_by_limit
+        end
+      end
+
+      def next_literal_start(tokens, index, minimum)
+        return minimum if index >= tokens.size
+        token = tokens[index]
+        if token.first == :literal
+          @uri.index(token.last, minimum)
+        else
+          minimum
+        end
+      end
+
+      def last_literal_start(tokens, index, minimum)
+        return @uri.size if index >= tokens.size
+        token = tokens[index]
+        return @uri.size if token.first != :literal
+
+        literal = token.last
+        position = nil
+        search_start = minimum
+        while (found = @uri.index(literal, search_start))
+          position = found
+          search_start = found + [literal.size, 1].max
+        end
+        position || -1
+      end
+
+      def parse_specs(specs, spec_index, start_position, end_position,
+                      prefix, operator, leader_present, tokens, token_index,
+                      values,
+                      candidate_reasons)
+        return if @stopped_by_limit
+
+        if spec_index >= specs.size
+          if start_position == end_position
+            search_tokens(
+              tokens, token_index + 1, end_position,
+              values, candidate_reasons
+            )
+          end
+          return
+        end
+
+        spec = specs[spec_index]
+        separator = variable_separator(operator)
+
+        if prefix
+          value_start = start_position
+          if start_position == end_position
+            assign_omitted_specs(
+              specs, spec_index, start_position, end_position,
+              operator, tokens, token_index, values, candidate_reasons
+            )
+          end
+          if spec_index == 0 && start_position < end_position &&
+             (next_start = omitted_first_spec_start(
+               specs, spec_index, start_position, operator
+             ))
+            absent_values(spec).each do |absent_value|
+              assign_value(values, spec, absent_value) do |next_values, reasons|
+                parse_specs(
+                  specs, spec_index + 1, next_start, end_position, true,
+                  operator, false, tokens, token_index, next_values,
+                  candidate_reasons | reasons
+                )
+              end
+            end
+          end
+        else
+          if start_position == end_position
+            assign_omitted_specs(
+              specs, spec_index, start_position, end_position,
+              operator, tokens, token_index, values, candidate_reasons
+            )
+            return
+          end
+          return if start_position >= end_position
+          return unless @uri[start_position, separator.size] == separator
+          value_start = start_position + separator.size
+        end
+
+        if !prefix && value_start <= end_position &&
+            @uri[start_position, separator.size] == separator
+          absent_values(spec).each do |absent_value|
+            assign_value(values, spec, absent_value) do |next_values, reasons|
+              parse_specs(
+                specs, spec_index + 1, value_start, end_position, true,
+                operator, leader_present, tokens, token_index, next_values,
+                candidate_reasons | reasons
+              )
+            end
+          end
+        end
+
+        (value_start..end_position).each do |cut|
+          raw = @uri[value_start...cut]
+          allow_empty_composite = !prefix || !leader_present
+          variable_options(
+            spec, operator, raw, allow_empty_composite
+          ).each do |value, option_reasons|
+            assign_value(values, spec, value) do |next_values, assign_reasons|
+              parse_specs(
+                specs, spec_index + 1, cut, end_position, false,
+                operator, leader_present, tokens, token_index,
+                next_values,
+                candidate_reasons | option_reasons | assign_reasons
+              )
+            end
+          end
+          return if @stopped_by_limit
+        end
+      end
+
+      def assign_omitted_specs(specs, spec_index, position, end_position,
+                               operator, tokens, token_index, values,
+                               candidate_reasons)
+        return unless position == end_position
+        enumerate_absent_specs(specs, spec_index, values) do |next_values|
+          search_tokens(
+            tokens, token_index + 1, position, next_values,
+            candidate_reasons
+          )
+        end
+      end
+
+      def omitted_first_spec_start(specs, spec_index, start_position, operator)
+        next_spec = specs[spec_index + 1]
+        return nil unless next_spec
+
+        label = next_spec[:name]
+        case operator
+        when "?", "&"
+          label_with_equals = "#{label}="
+          start_position if @uri[start_position, label_with_equals.size] ==
+            label_with_equals
+        when ";"
+          label_with_equals = "#{label}="
+          if @uri[start_position, label_with_equals.size] ==
+              label_with_equals
+            start_position
+          elsif @uri[start_position, label.size] == label
+            start_position
+          end
+        else
+          start_position
+        end
+      end
+
+      def variable_separator(operator)
+        case operator
+        when "?", "&"
+          "&"
+        when ";"
+          ";"
+        when ".", "/"
+          operator
+        else
+          ","
+        end
+      end
+
+      def assign_value(values, spec, value)
+        index = @variable_names.index(spec[:name])
+        if values[index] != UNASSIGNED && values[index] != value
+          if block_given?
+            return
+          else
+            return nil
+          end
+        end
+
+        next_values = values.dup
+        next_values[index] = value
+        if block_given?
+          yield next_values, Set.new
+        else
+          [next_values, Set.new]
+        end
+      end
+
+      def variable_options(spec, operator, raw, allow_empty_composite)
+        options = []
+        spec[:types].each do |type|
+          if type == "string"
+            string_options(spec, operator, raw).each do |option|
+              options << option
+            end
+          elsif type == "list"
+            list_options(
+              spec, operator, raw, allow_empty_composite
+            ).each { |option| options << option }
+          else
+            hash_options(
+              spec, operator, raw, allow_empty_composite
+            ).each { |option| options << option }
+          end
+        end
+        options
+      end
+
+      def string_options(spec, operator, raw)
+        return [[nil, Set.new]] if raw.nil?
+        stripped_raw = strip_nonexplode_label(spec, raw, operator)
+        return [] unless stripped_raw
+        value = decode_scalar(stripped_raw, operator, true)
+        return [] unless value
+        reasons = Set.new
+        if spec[:modifier] =~ /^:(\d+)$/
+          limit = $1.to_i
+          if value.size >= limit
+            reasons << :prefix_truncation
+          end
+        elsif spec[:modifier] == "*" &&
+            (operator.nil? || operator == "+" || operator == "#") &&
+            contains_separator?(raw, ",")
+          reasons << :explode_separator
+        end
+        [[value, reasons]]
+      rescue ArgumentError
+        []
+      end
+
+      def list_options(spec, operator, raw, allow_empty_composite)
+        return [[nil, Set.new]] if raw.nil?
+        return [] if prefix_spec?(spec)
+        candidate_values =
+          if spec[:modifier] == "*"
+            explode_list(spec, raw, operator)
+          else
+            nonexplode_list(spec, raw, operator)
+          end
+        return [] unless candidate_values
+
+        candidate_values.map do |value|
+          reasons = Set.new
+          if value.is_a?(Array) && value.empty? &&
+              list_empty_value_ambiguous?(operator)
+            reasons << :empty_value
+          end
+          [value, reasons]
+        end
+      rescue ArgumentError
+        []
+      end
+
+      def nonexplode_list(spec, raw, operator)
+        raw = strip_nonexplode_label(spec, raw, operator)
+        return nil unless raw
+
+        if reserved_operator?(operator)
+          values = []
+          each_encoded_partition(raw, ",") do |parts|
+            decoded = parts.map do |part|
+              value = decode_scalar(part, operator, true)
+              break nil unless value
+              value
+            end
+            values << decoded if decoded
+          end
+          values
+        else
+          [raw.split(",", -1).map do |part|
+             value = decode_scalar(part, operator, false)
+             break nil unless value
+             value
+           end]
+        end
+      end
+
+      def each_encoded_partition(raw, separator, &block)
+        positions = separator_positions(raw, separator)
+        each_choice(positions) do |chosen|
+          yield split_at(raw, chosen, separator)
+        end
+      end
+
+      def separator_positions(raw, separator)
+        positions = []
+        index = 0
+        while index <= raw.size - separator.size
+          if !inside_percent_encoding?(raw, index) &&
+              raw[index, separator.size] == separator
+            positions << index
+          end
+          index += 1
+        end
+        positions
+      end
+
+      def first_unencoded_position(raw, separator, start = 0)
+        index = start
+        while index <= raw.size - separator.size
+          if !inside_percent_encoding?(raw, index) &&
+              raw[index, separator.size] == separator
+            return index
+          end
+          index += 1
+        end
+        nil
+      end
+
+      def each_choice(positions)
+        (0..positions.size).each do |count|
+          positions.combination(count) do |chosen|
+            yield chosen
+          end
+        end
+      end
+
+      def split_at(raw, positions, separator)
+        parts = []
+        start = 0
+        positions.each do |position|
+          parts << raw[start...position]
+          start = position + separator.size
+        end
+        parts << raw[start..-1]
+        parts
+      end
+
+      def limit_reached(count)
+        @max_candidates && count >= @max_candidates
+      end
+
+      def explode_list(spec, raw, operator)
+        case operator
+        when ";", "?", "&"
+          separator = operator == ";" ? ";" : "&"
+          entries = split_encoded(raw, separator)
+          values = entries.map do |entry|
+            label = "#{spec[:name]}="
+            return nil unless entry.start_with?(label)
+            value = decode_scalar(entry[label.size..-1], operator, false)
+            return nil unless value
+            value
+          end
+          [values]
+        when ".", "/"
+          entries = split_encoded(raw, operator)
+          [entries.map do |entry|
+             value = decode_scalar(entry, operator, false)
+             break nil unless value
+             value
+           end]
+        else
+          values = []
+          each_encoded_partition(raw, ",") do |parts|
+            decoded = parts.map do |part|
+              value = decode_scalar(part, operator, true)
+              break nil unless value
+              value
+            end
+            values << decoded if decoded
+          end
+          values
+        end
+      end
+
+      def hash_options(spec, operator, raw, allow_empty_composite)
+        return [[nil, Set.new]] if raw.nil?
+        return [] if prefix_spec?(spec)
+        if raw.empty?
+          return [[{}, Set.new]] unless leader?(operator)
+          return []
+        end
+        options = []
+        if spec[:modifier] == "*"
+          explode_hash_options(raw, operator, options)
+        else
+          nonexplode_hash_options(spec, raw, operator, options)
+        end
+        options
+      rescue ArgumentError
+        options
+      end
+
+      def nonexplode_hash_options(spec, raw, operator, options)
+        raw = strip_nonexplode_label(spec, raw, operator)
+        return unless raw
+
+        if reserved_operator?(operator)
+          atom_parts = split_encoded(raw, ",")
+          each_field_partition(atom_parts, 2) do |pairs|
+            hash = {}
+            valid = true
+            pairs.each do |encoded_key, encoded_value|
+              key = decode_scalar(encoded_key, operator)
+              value = decode_scalar(encoded_value, operator)
+              unless key && value && !hash.key?(key)
+                valid = false
+                break
+              end
+              hash[key] = value
+            end
+            options << [hash, Set.new] if valid
+            return if limit_reached(options.size)
+          end
+        else
+          parts = raw.split(",", -1)
+          return unless parts.size.even?
+          hash = {}
+          parts.each_slice(2) do |encoded_key, encoded_value|
+            key = decode_scalar(encoded_key, operator, true)
+            value = decode_scalar(encoded_value, operator, true)
+            return unless key && value
+            return if hash.key?(key)
+            hash[key] = value
+          end
+          options << [hash, Set.new]
+        end
+      end
+
+      def explode_hash_options(raw, operator, options)
+        case operator
+        when ";", "?", "&"
+          separator = operator == ";" ? ";" : "&"
+          pairs = split_encoded(raw, separator)
+          hash = {}
+          pairs.each do |pair|
+            position = first_unencoded_position(pair, "=")
+            return unless position
+            key = decode_scalar(pair[0...position], operator, false)
+            value = decode_scalar(pair[(position + 1)..-1], operator, false)
+            return unless key && value
+            if hash.key?(key)
+              @reasons << :duplicate_key
+              return
+            end
+            hash[key] = value
+          end
+          options << [hash, Set.new]
+        when ".", "/"
+          separator = operator
+          positions = separator_positions(raw, separator)
+          each_choice(positions) do |chosen|
+            pairs = split_at(raw, chosen, separator)
+            hash = hash_from_pairs(pairs, operator)
+            options << [hash, Set.new] if hash
+            return if limit_reached(options.size)
+          end
+        else
+          if reserved_operator?(operator)
+            each_encoded_partition(raw, ",") do |pairs|
+              next unless pairs.size >= 1 && pairs.all? do |pair|
+                first_unencoded_position(pair, "=")
+              end
+              candidate = hash_from_pairs(pairs, operator, true)
+              if candidate
+                options << [candidate, Set.new]
+                return if limit_reached(options.size)
+              end
+            end
+          else
+            hash = hash_from_pairs(split_encoded(raw, ","), operator)
+            options << [hash, Set.new] if hash
+          end
+        end
+      end
+
+      def each_field_partition(parts, fields_per_record)
+        partition_records = lambda do |remaining, records|
+          if remaining.empty?
+            yield records
+            return
+          end
+
+          min_atoms = [fields_per_record, remaining.size].min
+          (min_atoms..remaining.size).each do |record_atoms|
+            segment = remaining[0...record_atoms].join(",")
+            split_position = segment.rindex(",")
+            next unless split_position
+            record = [
+              segment[0...split_position],
+              segment[(split_position + 1)..-1]
+            ]
+            partition_records.call(
+              remaining[record_atoms..-1] || [],
+              records + [record]
+            )
+          end
+        end
+        partition_records.call(parts, [])
+      end
+
+      def hash_from_pairs(pairs, operator, allow_separators=false)
+        hash = {}
+        pairs.each do |pair|
+          position = first_unencoded_position(pair, "=")
+          return nil unless position
+          key = decode_scalar(
+            pair[0...position], operator, allow_separators
+          )
+          value = decode_scalar(
+            pair[(position + 1)..-1], operator, allow_separators
+          )
+          return nil unless key && value
+          return nil if hash.key?(key)
+          hash[key] = value
+        end
+        hash
+      end
+
+      def strip_nonexplode_label(spec, raw, operator)
+        case operator
+        when ";"
+          if raw == spec[:name]
+            ""
+          elsif raw.start_with?("#{spec[:name]}=")
+            raw[(spec[:name].size + 1)..-1]
+          end
+        when "?", "&"
+          label = "#{spec[:name]}="
+          raw[label.size..-1] if raw.start_with?(label)
+        else
+          raw
+        end
+      end
+
+      def list_empty_value_ambiguous?(operator)
+        ["#", ".", "/", ";", "?", "&"].include?(operator)
+      end
+
+      def reserved_operator?(operator)
+        operator == "+" || operator == "#"
+      end
+
+      def prefix_spec?(spec)
+        !!(spec[:modifier] =~ /^:\d+$/)
+      end
+
+      def leader?(operator)
+        ["#", ".", "/", ";", "?", "&"].include?(operator)
+      end
+
+      def decode_scalar(raw, operator, allow_separators=false)
+        decoded = Addressable::URI.unencode_component(raw)
+        return nil if decoded.nil?
+        decoded = decoded.unicode_normalize(:nfc)
+        encode_map = decode_encode_map(operator, allow_separators)
+        encoded = Addressable::URI.encode_component(decoded, encode_map)
+        return nil unless encoded == raw
+        decoded
+      rescue ArgumentError, EncodingError
+        nil
+      end
+
+      def decode_encode_map(operator, allow_separators)
+        map =
+          if reserved_operator?(operator)
+            Addressable::URI::CharacterClasses::RESERVED +
+              Addressable::URI::CharacterClasses::UNRESERVED
+          else
+            Addressable::URI::CharacterClasses::UNRESERVED
+          end
+        unless allow_separators
+          map.delete(",")
+          map.delete("=")
+        end
+        map
+      end
+
+      def split_encoded(raw, separator)
+        parts = []
+        start = 0
+        index = 0
+        while index <= raw.size - separator.size
+          unless inside_percent_encoding?(raw, index)
+            if raw[index, separator.size] == separator
+              parts << raw[start...index]
+              start = index + separator.size
+              index = start
+              next
+            end
+          end
+          index += 1
+        end
+        parts << raw[start..-1]
+        parts
+      end
+
+      def contains_separator?(raw, separator)
+        split_encoded(raw, separator).size > 1
+      end
+
+      def inside_percent_encoding?(string, index)
+        index >= 2 && string[index - 2] == "%" &&
+          string[index - 1] =~ /\A[0-9a-fA-F]\z/
+      end
+
+      def emit_candidate(values, reasons)
+        mapping = {}
+        @variable_names.each_with_index do |name, index|
+          value = values[index]
+          mapping[name] = value if value != UNASSIGNED
+        end
+
+        expanded = normalize_percent_encoding(
+          @template.expand(mapping).to_str
+        )
+        return unless expanded == normalize_percent_encoding(@uri)
+
+        return if @candidates.include?(mapping)
+        if @max_candidates && @candidates.size >= @max_candidates
+          @complete = false
+          @stopped_by_limit = true
+          return
+        end
+
+        @candidates << mapping
+        reasons.each { |reason| @reasons << reason }
+        if reasons.include?(:prefix_truncation)
+          @complete = false
+          @prefix_truncated = true
+          @stopped_by_limit = true
+        end
+      end
+
+      def normalize_percent_encoding(string)
+        string.gsub(/%[0-9a-fA-F]{2}/, &:upcase)
+      end
+
+      def percent_encoding_equal?(actual, expected)
+        normalize_percent_encoding(actual) ==
+          normalize_percent_encoding(expected)
+      end
+    end
+
     def ordered_variable_defaults
       @ordered_variable_defaults ||= begin
         expansions, _ = parse_template_pattern(pattern)
