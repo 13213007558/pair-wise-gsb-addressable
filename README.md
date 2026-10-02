@@ -86,6 +86,30 @@ template.extract(uri)
 #   "two" => "2",
 #   "fragment" => "foo"
 # }
+
+# Typed reverse expansion preserves lists and maps instead of guessing from
+# strings. Every candidate is re-expanded against the template.
+result = Addressable::Template
+  .new("http://example.com/{?filters*}")
+  .extract_candidates(
+    "http://example.com/?a=1&b=2",
+    "filters" => :map
+  )
+result.candidates
+#=> [{"filters" => {"a" => "1", "b" => "2"}}]
+result.complete?
+#=> true
+
+# Some outputs have more than one valid input. Declare multiple types to get
+# every proven candidate. `truncated?` distinguishes no solution from a result
+# limited before all possibilities were enumerated.
+result = Addressable::Template
+  .new("{?value}")
+  .extract_candidates("?value=a,b", "value" => [:list, :map])
+result.candidates
+#=> [{"value" => ["a", "b"]}, {"value" => {"a" => "b"}}]
+result.ambiguous?
+#=> true
 ```
 
 ## Install

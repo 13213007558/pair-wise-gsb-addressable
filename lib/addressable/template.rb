@@ -93,6 +93,77 @@ module Addressable
     end
 
     ##
+    # This class represents a set of proven mappings returned by a typed
+    # reverse expansion. Every candidate is verified by expanding it with the
+    # original template.
+    class CandidateSet
+      include Enumerable
+
+      # @api private
+      def initialize(candidates, ambiguities = [], complete = true,
+                     truncated = false)
+        @candidates = candidates.dup.freeze
+        @ambiguities = ambiguities.dup.freeze
+        @complete = complete && !truncated
+        @truncated = truncated
+      end
+
+      # @return [Array<Hash>] The verified candidate mappings.
+      attr_reader :candidates
+
+      # @return [Array<Hash>] Machine-readable ambiguity explanations.
+      attr_reader :ambiguities
+
+      # @return [Boolean] Whether the finite candidate set was fully enumerated.
+      def complete?
+        @complete
+      end
+
+      # @return [Boolean] Whether the supplied candidate limit was reached.
+      def truncated?
+        @truncated
+      end
+
+      # @return [Boolean] Whether there is no proven candidate.
+      def no_solution?
+        complete? && candidates.empty?
+      end
+
+      # @return [Boolean] Whether the inverse is known to have more than one
+      #   compatible interpretation or a structurally unbounded ambiguity.
+      def ambiguous?
+        candidates.size > 1 || !complete? || !ambiguities.empty?
+      end
+
+      def each(&block)
+        candidates.each(&block)
+      end
+
+      def size
+        candidates.size
+      end
+      alias_method :length, :size
+
+      def [](index)
+        candidates[index]
+      end
+
+      def first
+        candidates.first
+      end
+
+      def to_a
+        candidates.dup
+      end
+
+      def inspect
+        "#<#{self.class} candidates=#{candidates.inspect} " \
+          "complete=#{complete?} truncated=#{truncated?} " \
+          "ambiguities=#{ambiguities.inspect}>"
+      end
+    end
+
+    ##
     # This class represents the data that is extracted when a Template
     # is matched against a URI.
     class MatchData
@@ -345,6 +416,40 @@ module Addressable
       match_data = self.match(uri, processor)
       return (match_data ? match_data.mapping : nil)
     end
+
+    ##
+    # Performs a typed reverse expansion. Unlike {#extract}, this method does
+    # not guess whether an expanded value was a scalar, list, or map. Callers
+    # declare the accepted RFC 6570 variable types for each template variable.
+    #
+    # Types are +:scalar+ (also +:string+), +:list+ (also +:array+), and
+    # +:map+ (also +:hash+). A variable may accept several types by providing
+    # them in an Array. Every returned candidate is verified by expanding it
+    # against this template. The result also distinguishes an actual lack of a
+    # solution from ambiguities whose candidate set was not fully enumerated.
+    #
+    # Prefix modifiers, adjacent expansions without separators, duplicate map
+    # keys, and indistinguishable empty and missing values may make a template
+    # non-invertible. Such cases are reported as ambiguity rather than resolved
+    # by choosing an arbitrary mapping.
+    #
+    # @param [Addressable::URI, #to_str] uri The URI to reverse expand.
+    # @param [Hash] types Variable names mapped to one or more accepted types.
+    # @param [Integer, nil] limit Maximum number of verified candidates.
+    #   Defaults to 100; use +nil+ to request an exhaustive result.
+    # @param [Boolean] normalize_values Whether to NFC normalize candidates.
+    #
+    # @return [Addressable::Template::CandidateSet]
+    def extract_candidates(uri, types, limit=100, normalize_values=true)
+      if !limit.nil? && (!limit.is_a?(Integer) || limit < 0)
+        raise ArgumentError, "limit must be a non-negative Integer or nil"
+      end
+      TypedExtractor.new(self, normalize_keys(types), limit, normalize_values)
+        .extract(uri)
+    end
+
+    # @see #extract_candidates
+    alias_method :reverse_expand, :extract_candidates
 
     ##
     # Extracts match data from the URI using a URI Template pattern.
@@ -1046,6 +1151,977 @@ module Addressable
       # Ensure that the regular expression matches the whole URI.
       regexp_string = "\\A#{regexp_string}\\z"
       return expansions, Regexp.new(regexp_string)
+    end
+
+    TYPE_ALIASES = {
+      "scalar" => :scalar,
+      "string" => :scalar,
+      "list" => :list,
+      "array" => :list,
+      "map" => :map,
+      "hash" => :map
+    }.freeze
+
+    class TypedExtractor
+      def initialize(template, types, limit, normalize_values)
+        @template = template
+        @limit = limit
+        @normalize_values = normalize_values
+        @types = normalize_types(types)
+        @prefix_ambiguity = false
+        @spec_index = 0
+        @specs_by_key = {}
+      end
+
+      def extract(uri)
+        @target = uri.is_a?(Addressable::URI) ? uri.to_str : uri.to_str
+        target = @target
+        states = [new_state]
+
+        tokens.each do |token|
+          if token[:literal]
+            states = states.flat_map do |state|
+              position = state[:position]
+              if target[position, token[:literal].length] == token[:literal]
+                [advance(state, token[:literal].length)]
+              else
+                []
+              end
+            end
+          end
+
+          if token[:expression]
+            states = states.flat_map do |state|
+              parsed = parse_expression(token, target, state[:position])
+              parsed.map { |candidate| merge_expression(state, candidate) }
+            end.compact
+            states = prune_states(states)
+          end
+        end
+
+        states = states.select { |state| state[:position] == target.length }
+        build_result(states)
+      end
+
+      private
+      def normalize_types(types)
+        result = {}
+        types.each do |name, type|
+          name = name.to_s
+          names = Array(type).map do |value|
+            key = value.to_s
+            TYPE_ALIASES.fetch(key) do
+              raise ArgumentError,
+                "unsupported variable type: #{value.inspect}"
+            end
+          end.uniq
+          result[name] = names
+        end
+        result
+      end
+
+      def tokens
+        @tokens ||= begin
+          result = []
+          index = 0
+          @template.pattern.scan(EXPRESSION) do
+            expression_match = $~
+            before = expression_match.pre_match
+            if before.length > index
+              result << { :literal => @template.pattern[index...before.length] }
+              index = before.length
+            end
+            expression = expression_match[0]
+            _, operator, varlist = *expression.match(EXPRESSION)
+            specs = varlist.split(",").map do |varspec|
+              _, name, modifier = *varspec.match(VARSPEC)
+              @spec_index += 1
+              {
+                :name => name,
+                :modifier => modifier,
+                :key => "#{name}\0#{@spec_index}"
+              }
+            end
+            specs.each do |spec|
+              unless @types.key?(spec[:name])
+                raise ArgumentError,
+                  "missing type declaration for variable #{spec[:name].inspect}"
+              end
+              @prefix_ambiguity = true if spec[:modifier] =~ /^:\d+/
+              @specs_by_key[spec[:key]] = spec
+            end
+            result << {
+              :expression => expression,
+              :operator => operator,
+              :specs => specs
+            }
+            index = expression_match.end(0)
+          end
+          if index < @template.pattern.length
+            result << { :literal => @template.pattern[index..-1] }
+          end
+          result
+        end
+      end
+
+      def new_state
+        {
+          :position => 0,
+          :mapping => {},
+          :reasons => [],
+          :infinite => false,
+          :truncated => false
+        }
+      end
+
+      def advance(state, amount)
+        copy = state.dup
+        copy[:position] += amount
+        copy[:mapping] = state[:mapping].dup
+        copy[:reasons] = state[:reasons].dup
+        copy
+      end
+
+      def parse_expression(token, target, start)
+        leader = LEADERS.fetch(token[:operator], "")
+        absent = {
+          :length => 0,
+          :mapping => absent_mapping(token[:specs]),
+          :reasons => [],
+          :infinite => false,
+          :truncated => false
+        }
+        results = [absent]
+        if target[start, leader.length] == leader
+          payload_start = start + leader.length
+          parsed = if %w(; ? &).include?(token[:operator])
+                     parse_form_expression(
+                       token[:specs], target, payload_start, token[:operator]
+                     )
+                   else
+                     parse_generic_expression(
+                       token[:specs], target, payload_start, token[:operator]
+                     )
+                   end
+          parsed.each do |candidate|
+            candidate[:length] += leader.length
+            results << candidate
+          end
+        end
+        results
+      end
+
+      def absent_mapping(specs)
+        specs.map { |spec| [spec[:key], nil] }.to_h
+      end
+
+      def merge_expression(state, expression)
+        mapping = state[:mapping].dup
+        expression[:mapping].each do |name, value|
+          if mapping.key?(name)
+            return nil unless mapping[name] == value
+          else
+            mapping[name] = value
+          end
+        end
+        merged = state.dup
+        merged[:position] = state[:position] + expression[:length]
+        merged[:mapping] = mapping
+        merged[:reasons] = (state[:reasons] + expression[:reasons]).uniq
+        merged[:infinite] = state[:infinite] || expression[:infinite]
+        merged[:truncated] = state[:truncated] || expression[:truncated]
+        merged
+      end
+
+      def parse_generic_expression(specs, target, position, operator)
+        parse_generic_vars(
+          specs, 0, target, position, operator, false, false
+        )
+      end
+
+      def parse_generic_vars(specs, index, target, position, operator,
+                             seen_defined, leading_empty)
+        options = []
+        if index >= specs.length
+          if !seen_defined || position == target.length
+            options << { :length => 0, :mapping => {}, :reasons => [],
+                         :infinite => false, :truncated => false }
+          end
+          return options
+        end
+
+        spec = specs[index]
+        options.concat(parse_generic_absent(
+          specs, index, target, position, operator,
+          seen_defined, leading_empty
+        ))
+        @types[spec[:name]].each do |type|
+          options.concat(parse_generic_defined(
+            spec, type, specs, index, target, position, operator,
+            seen_defined, leading_empty
+          ))
+        end
+        options
+      end
+
+      def parse_generic_absent(specs, index, target, position, operator,
+                               seen_defined, leading_empty)
+        rest = parse_generic_vars(
+          specs, index + 1, target, position, operator,
+          seen_defined, leading_empty
+        )
+        rest.map do |candidate|
+          candidate[:mapping] = { specs[index][:key] => nil }.merge(
+            candidate[:mapping]
+          )
+          if position < target.length && !seen_defined &&
+             @types[specs[index][:name]].include?(:scalar)
+            candidate[:reasons] |= [empty_reason(specs[index][:name])]
+          end
+          candidate
+        end
+      end
+
+      def parse_generic_defined(spec, type, specs, index, target, position,
+                                operator, seen_defined, leading_empty)
+        outer = generic_outer(operator)
+        if type == :scalar
+          parse_generic_scalar(
+            spec, specs, index, target, position, operator,
+            seen_defined, leading_empty, outer
+          )
+        elsif type == :list
+          parse_generic_list(
+            spec, specs, index, target, position, operator,
+            seen_defined, leading_empty, outer
+          )
+        else
+          parse_generic_map(
+            spec, specs, index, target, position, operator,
+            seen_defined, leading_empty, outer
+          )
+        end
+      end
+
+      def parse_generic_scalar(spec, specs, index, target, position, operator,
+                               seen_defined, leading_empty, outer)
+        if !seen_defined
+          options = continue_empty_generic(
+            spec, "", specs, index, target, position, operator,
+            false, leading_empty
+          )
+          options.each do |candidate|
+            candidate[:reasons] << empty_reason(spec[:name])
+          end
+        else
+          options = []
+        end
+
+        prefix = prefix_length(spec)
+        generic_scalar_end_positions(target, position, operator).each do |stop|
+          raw = target[position...stop]
+          next unless valid_raw?(raw, operator)
+          value = decode(raw)
+          next if value.nil?
+          infinite = !prefix.nil? && value.length > prefix
+          options.concat(continue_generic(
+            { spec[:key] => value }, specs, index, target,
+            position, stop, operator, true, leading_empty,
+            infinite ? prefix_reason(spec[:name]) : nil, infinite
+          ))
+        end
+        options
+      end
+
+      def generic_scalar_end_positions(target, position, operator)
+        (position..target.length).to_a
+      end
+
+      def parse_generic_list(spec, specs, index, target, position, operator,
+                             seen_defined, leading_empty, outer)
+        options = []
+        if !seen_defined
+          empty = continue_empty_generic(
+            spec, [], specs, index, target, position, operator,
+            true, leading_empty
+          )
+          if @types[spec[:name]].include?(:scalar)
+            empty.each { |candidate| candidate[:reasons] << empty_reason(spec[:name]) }
+          end
+          options.concat(empty)
+        end
+        positions = generic_part_end_positions(target, position, operator)
+        if spec[:modifier] == "*"
+          positions.each do |stop|
+            list_partitions(
+              target[position...stop], outer, operator
+            ).each do |parts|
+              decoded = parts.map { |value| decode(value) }
+              next unless decoded.all? &&
+                parts.all? { |value| valid_raw?(value, operator) }
+              options.concat(continue_generic(
+                { spec[:key] => decoded }, specs, index, target,
+                position, stop, operator, true, leading_empty
+              ))
+            end
+          end
+        else
+          positions.each do |stop|
+            raw = target[position...stop]
+            partitions = if reserved_operator?(operator)
+                           list_partitions(raw, ",", operator)
+                         else
+                           values = split_raw(raw, ",")
+                           values.all? { |value| valid_raw?(value, operator) } ?
+                             [values] : []
+                         end
+            partitions.each do |values|
+              decoded = values.map { |value| decode(value) }
+              next unless decoded.all?
+              options.concat(continue_generic(
+                { spec[:key] => decoded }, specs, index, target,
+                position, stop, operator, true, leading_empty
+              ))
+            end
+          end
+        end
+        options
+      end
+
+      def parse_generic_map(spec, specs, index, target, position, operator,
+                            seen_defined, leading_empty, outer)
+        options = []
+        if !seen_defined
+          empty = continue_empty_generic(
+            spec, {}, specs, index, target, position, operator,
+            true, leading_empty
+          )
+          if @types[spec[:name]].include?(:scalar)
+            empty.each { |candidate| candidate[:reasons] << empty_reason(spec[:name]) }
+          end
+          options.concat(empty)
+        end
+        positions = generic_part_end_positions(target, position, operator)
+        if spec[:modifier] == "*"
+          positions.each do |stop|
+            map_pair_partitions(
+              target[position...stop], outer, operator
+            ).each do |pairs|
+              pairs = pairs.map do |key, value|
+                [decode(key), decode(value)]
+              end
+              next if pairs.any? { |key, value| key.nil? || value.nil? }
+              mapping = pairs.to_h
+              next if mapping.length != pairs.length
+              options.concat(continue_generic(
+                { spec[:key] => mapping }, specs, index, target,
+                position, stop, operator, true, leading_empty
+              ))
+            end
+          end
+        else
+          positions.each do |stop|
+            raw = target[position...stop]
+            mapping = if reserved_operator?(operator)
+                        pairs = nonexplode_map_pair_partitions(
+                          raw, ",", operator
+                        )
+                        next if pairs.empty?
+                        options.concat(pairs.flat_map do |decoded_pairs|
+                          continue_generic(
+                            { spec[:key] => decoded_pairs.to_h }, specs, index,
+                            target, position, stop, operator, true,
+                            leading_empty
+                          ).reject do |candidate|
+                            decoded_pairs.to_h.length != decoded_pairs.length
+                          end
+                        end)
+                        next
+                      else
+                        atoms = split_raw(raw, ",")
+                        next if atoms.empty? || atoms.length.odd?
+                        next unless atoms.all? { |atom|
+                          valid_raw?(atom, operator)
+                        }
+                        values = atoms.map { |atom| decode(atom) }
+                        next if values.any?(&:nil?)
+                        pairs = values.each_slice(2).to_a
+                        next if pairs.any? { |pair| pair.length != 2 }
+                        result = pairs.to_h
+                        next if result.length != pairs.length
+                        result
+                      end
+            next if mapping.nil?
+            options.concat(continue_generic(
+              { spec[:key] => mapping }, specs, index, target,
+              position, stop, operator, true, leading_empty
+            ))
+          end
+        end
+        options
+      end
+
+      def generic_part_end_positions(target, position, operator)
+        (position..target.length).to_a
+      end
+
+      def continue_empty_generic(spec, value, specs, index, target, position,
+                                 operator, seen_defined, leading_empty)
+        options = continue_generic(
+          { spec[:key] => value }, specs, index, target,
+          position, position, operator, seen_defined, leading_empty
+        )
+        if !seen_defined && position < target.length &&
+           target[position] == generic_outer(operator)
+          options.concat(continue_generic(
+            { spec[:key] => value }, specs, index, target,
+            position, position + 1, operator, true, true, nil, false, true
+          ))
+        end
+        options
+      end
+
+      def continue_generic(mapping, specs, index, target, start, stop,
+                           operator, seen_defined, leading_empty,
+                           reason = nil, infinite = false, consume_delimiter = nil)
+        outer = generic_outer(operator)
+        if index + 1 >= specs.length
+          result = expression_candidate(
+            stop - start, mapping, [reason].compact, infinite
+          )
+          return [result]
+        end
+
+        consume_delimiter = if !consume_delimiter.nil?
+                              consume_delimiter
+                            elsif seen_defined && stop < target.length &&
+                                  target[stop] == outer
+                              true
+                            else
+                              false
+                            end
+        next_position = stop + (consume_delimiter ? 1 : 0)
+        rest = parse_generic_vars(
+          specs, index + 1, target, next_position, operator,
+          seen_defined, seen_defined
+        )
+        rest.map do |candidate|
+          candidate[:length] += stop - start
+          candidate[:length] += 1 if consume_delimiter
+          candidate[:mapping] = mapping.merge(candidate[:mapping])
+          candidate[:reasons] |= [reason].compact
+          candidate[:infinite] ||= infinite
+          candidate
+        end
+      end
+
+      def generic_outer(operator)
+        case operator
+        when "/" then "/"
+        when "." then "."
+        else ","
+        end
+      end
+
+      def reserved_operator?(operator)
+        operator == "+" || operator == "#"
+      end
+
+      def parse_form_expression(specs, target, position, operator)
+        parse_form_vars(specs, 0, target, position, operator, false)
+      end
+
+      def parse_form_vars(specs, index, target, position, operator,
+                          seen_defined)
+        options = []
+        if index >= specs.length
+          options << expression_candidate(0, {})
+          return options
+        end
+
+        spec = specs[index]
+        options.concat(parse_form_absent(
+          specs, index, target, position, operator, seen_defined
+        ))
+        @types[spec[:name]].each do |type|
+          options.concat(parse_form_defined(
+            spec, type, specs, index, target, position,
+            operator, seen_defined
+          ))
+        end
+        options
+      end
+
+      def parse_form_absent(specs, index, target, position, operator,
+                            seen_defined)
+        parse_form_vars(
+          specs, index + 1, target, position, operator, seen_defined
+        ).map do |candidate|
+          candidate[:mapping] = { specs[index][:key] => nil }.merge(
+            candidate[:mapping]
+          )
+          if position < target.length && !seen_defined &&
+             @types[specs[index][:name]].include?(:scalar)
+            candidate[:reasons] |= [empty_reason(specs[index][:name])]
+          end
+          candidate
+        end
+      end
+
+      def parse_form_defined(spec, type, specs, index, target, position,
+                             operator, seen_defined)
+        joiner = form_joiner(operator)
+        if type == :scalar || (type == :list && spec[:modifier] != "*")
+          parse_form_scalar_or_list(
+            spec, type, specs, index, target, position,
+            operator, joiner, seen_defined
+          )
+        elsif type == :list
+          parse_form_explode_list(
+            spec, specs, index, target, position,
+            operator, joiner, seen_defined
+          )
+        else
+          if spec[:modifier] == "*"
+            parse_form_map(
+              spec, specs, index, target, position,
+              operator, joiner, seen_defined
+            )
+          else
+            parse_form_nonexplode_map(
+              spec, specs, index, target, position,
+              operator, joiner, seen_defined
+            )
+          end
+        end
+      end
+
+      def parse_form_scalar_or_list(spec, type, specs, index, target,
+                                    position, operator, joiner, seen_defined)
+        segment, stop = form_segment(target, position, joiner)
+        return [] if segment.nil? || !segment.start_with?(spec[:name])
+
+        body = segment[spec[:name].length..-1]
+        return [] unless body.empty? || body.start_with?("=")
+        raw_value = body.start_with?("=") ? body[1..-1] : ""
+        return [] unless valid_form_raw?(raw_value)
+        decoded_value = decode(raw_value)
+        return [] if decoded_value.nil?
+
+        value = decoded_value
+        if type == :list
+          raw_parts = raw_value.empty? ? [] : split_raw(raw_value, ",")
+          return [] unless raw_parts.all? { |part| valid_form_raw?(part) }
+          value = raw_parts.map { |part| decode(part) }
+          return [] if value.any?(&:nil?)
+        end
+
+        prefix = prefix_length(spec)
+        infinite = type == :scalar && !prefix.nil? &&
+                   decoded_value.length > prefix
+        reasons = []
+        reasons << prefix_reason(spec[:name]) if infinite
+        continue_form(
+          { spec[:key] => value }, specs, index, target,
+          position, stop, operator, joiner, true, reasons, infinite
+        )
+      end
+
+      def parse_form_explode_list(spec, specs, index, target, position,
+                                  operator, joiner, seen_defined)
+        options = []
+        if !seen_defined && position == target.length
+          candidate = continue_form(
+            { spec[:key] => [] }, specs, index, target,
+            position, position, operator, joiner, true
+          )
+          if @types[spec[:name]].include?(:scalar)
+            candidate.each { |entry| entry[:reasons] << empty_reason(spec[:name]) }
+          end
+          options.concat(candidate)
+        end
+        each_form_segment_end(target, position, joiner) do |segments, stop|
+          matching = segments.take_while do |segment|
+            segment.start_with?("#{spec[:name]}=")
+          end
+          next if matching.empty?
+          values = matching.map do |segment|
+            raw_value = segment[(spec[:name].length + 1)..-1]
+            next nil unless valid_form_raw?(raw_value)
+            decode(raw_value)
+          end
+          next if values.any?(&:nil?)
+          consumed = matching.sum(0) { |part| part.length + joiner.length } -
+                     joiner.length
+          options.concat(continue_form(
+            { spec[:key] => values }, specs, index, target,
+            position, position + consumed, operator, joiner, true
+          ))
+        end
+        options
+      end
+
+      def parse_form_map(spec, specs, index, target, position,
+                         operator, joiner, seen_defined)
+        options = []
+        each_form_segment_end(target, position, joiner) do |segments, stop|
+          next if segments.empty?
+          values = segments.map do |segment|
+            equals = segment.index("=")
+            next nil unless equals
+            raw_key = segment[0...equals]
+            raw_value = segment[(equals + 1)..-1]
+            next nil unless valid_form_raw?(raw_key) &&
+                              valid_form_raw?(raw_value)
+            [decode(raw_key), decode(raw_value)]
+          end
+          next if values.any?(&:nil?)
+          mapping = values.to_h
+          next if mapping.length != values.length
+          options.concat(continue_form(
+            { spec[:key] => mapping }, specs, index, target,
+            position, stop, operator, joiner, true
+          ))
+        end
+        options
+      end
+
+      def parse_form_nonexplode_map(spec, specs, index, target, position,
+                                    operator, joiner, seen_defined)
+        segment, stop = form_segment(target, position, joiner)
+        return [] if segment.nil? || !segment.start_with?("#{spec[:name]}=")
+
+        raw = segment[(spec[:name].length + 1)..-1]
+        atoms = split_raw(raw, ",")
+        return [] if atoms.empty? || atoms.length.odd?
+        return [] unless atoms.all? { |atom| valid_form_raw?(atom) }
+        values = atoms.map { |atom| decode(atom) }
+        return [] if values.any?(&:nil?)
+        pairs = values.each_slice(2).to_a
+        mapping = pairs.to_h
+        return [] if mapping.length != pairs.length
+        continue_form(
+          { spec[:key] => mapping }, specs, index, target,
+          position, stop, operator, joiner, true
+        )
+      end
+
+      def continue_form(mapping, specs, index, target, start, stop,
+                        operator, joiner, seen_defined,
+                        reasons = [], infinite = false)
+        if index + 1 >= specs.length
+          return [expression_candidate(
+            stop - start, mapping, reasons, infinite
+          )]
+        end
+
+        next_position = stop
+        if next_position < target.length &&
+           target[next_position] == joiner
+          next_position += 1
+        end
+        rest = parse_form_vars(
+          specs, index + 1, target, next_position, operator, seen_defined
+        )
+        rest.map do |candidate|
+          candidate[:length] += stop - start
+          candidate[:mapping] = mapping.merge(candidate[:mapping])
+          candidate[:reasons] |= reasons
+          candidate[:infinite] ||= infinite
+          candidate
+        end
+      end
+
+      def form_joiner(operator)
+        operator == ";" ? ";" : "&"
+      end
+
+      def form_segment(target, position, joiner)
+        stop = form_delimiter_positions(target, position, joiner).first ||
+          target.length
+        [target[position...stop], stop]
+      end
+
+      def each_form_segment_end(target, position, joiner)
+        positions = form_delimiter_positions(target, position, joiner)
+        positions.each do |stop|
+          yield(split_raw(target[position...stop], joiner), stop)
+        end
+        yield(split_raw(target[position..-1], joiner), target.length)
+      end
+
+      def form_delimiter_positions(target, position, joiner)
+        delimiter_positions(target[position..-1], joiner).map do |offset|
+          position + offset
+        end
+      end
+
+      def valid_form_raw?(raw)
+        source = Addressable::URI::CharacterClasses::PCHAR + "/?"
+        raw.match?(/\A(?:[#{source}]|%[a-fA-F0-9]{2})*\z/)
+      end
+
+      def expression_candidate(length, mapping, reasons = [], infinite = false)
+        {
+          :length => length,
+          :mapping => mapping,
+          :reasons => reasons.compact.uniq,
+          :infinite => infinite,
+          :truncated => false
+        }
+      end
+
+      def prefix_length(spec)
+        return nil unless spec[:modifier] =~ /^:\d+/
+        spec[:modifier][1..-1].to_i
+      end
+
+      def empty_reason(name)
+        { :reason => :empty_or_missing, :variable => name }
+      end
+
+      def prefix_reason(name)
+        { :reason => :prefix_truncation, :variable => name }
+      end
+
+      def prefix_variables
+        tokens.select { |token| token[:specs] }.flat_map { |token|
+          token[:specs].select { |spec| spec[:modifier] =~ /^:\d+/ }
+                       .map { |spec| spec[:name] }
+        }.uniq
+      end
+
+      def decode(raw)
+        return nil if raw.nil?
+        Addressable::URI.unencode_component(raw)
+      end
+
+      def valid_raw?(raw, operator)
+        source = case operator
+                 when "+", "#"
+                   Addressable::URI::CharacterClasses::RESERVED +
+                     Addressable::URI::CharacterClasses::UNRESERVED
+                 when "."
+                   Addressable::URI::CharacterClasses::UNRESERVED
+                     .gsub("\\.", "")
+                 else
+                   Addressable::URI::CharacterClasses::UNRESERVED
+                 end
+        raw.match?(/\A(?:[#{source}]|%[a-fA-F0-9]{2})*\z/)
+      end
+
+      def delimiter_positions(raw, delimiter)
+        (0...raw.length).select do |position|
+          raw[position] == delimiter && !encoded_position?(raw, position)
+        end
+      end
+
+      def encoded_position?(raw, position)
+        position >= 2 && raw[position - 2] == "%" &&
+          raw[(position - 1), 2] =~ /\A[a-fA-F0-9]{2}\z/
+      end
+
+      def split_raw(raw, delimiter)
+        positions = delimiter_positions(raw, delimiter)
+        start = 0
+        parts = positions.each_with_object([]) do |position, result|
+          result << raw[start...position]
+          start = position + 1
+        end
+        parts << raw[start..-1]
+        parts
+      end
+
+      def split_at_positions(raw, positions)
+        start = 0
+        parts = positions.each_with_object([]) do |position, result|
+          result << raw[start...position]
+          start = position + 1
+        end
+        parts << raw[start..-1]
+        parts
+      end
+
+      def list_partitions(raw, delimiter, operator)
+        positions = delimiter_positions(raw, delimiter)
+        cuts = reserved_operator?(operator) ?
+          all_combinations(positions) : [positions]
+        cuts.map { |chosen| split_at_positions(raw, chosen) }
+            .select { |parts|
+              parts.all? { |part| valid_raw?(part, operator) }
+            }
+      end
+
+      def map_pair_partitions(raw, delimiter, operator)
+        boundaries = if reserved_operator?(operator)
+                       delimiter_positions(raw, delimiter) +
+                         delimiter_positions(raw, "=")
+                     else
+                       delimiter_positions(raw, delimiter) +
+                       delimiter_positions(raw, "=")
+                     end.uniq.sort
+        cuts = all_combinations(boundaries).select do |chosen|
+          parts = split_at_positions(raw, chosen)
+          parts.length.even? && parts.each_slice(2).all? do |key, value|
+            key.include?("=")
+          end
+        end
+        cuts.flat_map do |chosen|
+          pair_options = split_at_positions(raw, chosen).map do |part|
+            if reserved_operator?(operator)
+              equal_positions(part, operator).map do |position|
+                [part[0...position], part[(position + 1)..-1]]
+              end.select do |key, value|
+                valid_raw?(key, operator) && valid_raw?(value, operator)
+              end
+            else
+              position = part.index("=")
+              next [] unless position
+              key = part[0...position]
+              value = part[(position + 1)..-1]
+              next [] unless valid_raw?(key, operator) &&
+                              valid_raw?(value, operator)
+              [[key, value]]
+            end
+          end
+          next [] if pair_options.any?(&:empty?)
+          cartesian(pair_options)
+        end
+      end
+
+      def nonexplode_map_pair_partitions(raw, delimiter, operator)
+        positions = delimiter_positions(raw, delimiter)
+        cuts = if reserved_operator?(operator)
+                 all_combinations(positions)
+               else
+                 [positions]
+               end
+        cuts.map do |chosen|
+          parts = split_at_positions(raw, chosen)
+          next unless parts.length.even?
+          next unless parts.all? { |part| valid_raw?(part, operator) }
+          decoded = parts.map { |part| decode(part) }
+          next if decoded.any?(&:nil?)
+          decoded.each_slice(2).to_a
+        end.compact.uniq
+      end
+
+      def all_combinations(values)
+        (0..values.length).flat_map do |count|
+          values.combination(count).to_a
+        end
+      end
+
+      def cartesian(values)
+        values.inject([[]]) do |result, options|
+          result.flat_map do |prefix|
+            options.map { |option| prefix + [option] }
+          end
+        end
+      end
+
+      def equal_positions(raw, operator)
+        if reserved_operator?(operator)
+          return (0...raw.length).select do |position|
+            raw[position] == "="
+          end
+        end
+        raw.index("=") ? [raw.index("=")] : []
+      end
+
+      def prune_states(states)
+        pruned = states.uniq { |state|
+          [state[:position], state[:mapping], state[:reasons],
+           state[:infinite], state[:truncated]]
+        }
+        pruned
+      end
+
+      def build_result(states)
+        candidates = []
+        prefix_states = {}
+        reasons = []
+        truncated = false
+
+        states.each do |state|
+          mapping = complete_mapping(state[:mapping])
+          next unless mapping
+          next unless verified?(mapping, target_of(mapping))
+          reasons.concat(state[:reasons])
+          if !candidates.include?(mapping)
+            if @limit && candidates.length >= @limit
+              truncated = true
+              break
+            end
+            candidates << mapping
+            prefix_states[mapping] = state if prefix_ambiguous?(mapping)
+          end
+        end
+
+        infinite = @prefix_ambiguity && !candidates.empty?
+        if infinite
+          variables = prefix_variables_for(prefix_states.values)
+          reasons << {
+            :reason => :prefix_truncation,
+            :variables => variables
+          }
+        end
+        if candidates.size > 1
+          reasons << { :reason => :multiple_candidates }
+        end
+        truncated = true if @limit && states.size > candidates.size &&
+                            candidates.size >= @limit
+        truncated ||= @limit == 0 && !states.empty?
+        ambiguities = reasons.uniq
+
+        CandidateSet.new(
+          candidates,
+          ambiguities,
+          !infinite && !truncated,
+          truncated
+        )
+      end
+
+      def complete_mapping(mapping)
+        result = {}
+        @specs_by_key.values.each do |spec|
+          value = mapping[spec[:key]]
+          if result.key?(spec[:name])
+            return nil unless result[spec[:name]] == value
+          else
+            result[spec[:name]] = value
+          end
+        end
+        result
+      end
+
+      def prefix_ambiguous?(mapping)
+        @specs_by_key.values.any? do |spec|
+          length = prefix_length(spec)
+          next false unless length
+          value = mapping[spec[:name]]
+          value.is_a?(String)
+        end
+      end
+
+      def prefix_variables_for(states)
+        state_reasons = states.flat_map { |state| state[:reasons] }
+        prefixes = state_reasons.select do |reason|
+          reason[:reason] == :prefix_truncation
+        end.map { |reason| reason[:variable] }
+        return prefixes unless prefixes.empty?
+        prefix_variables
+      end
+
+      def target_of(mapping)
+        @template.expand(
+          mapping, nil, @normalize_values
+        ).to_str
+      end
+
+      def verified?(mapping, expanded)
+        expanded == @target
+      end
     end
 
   end

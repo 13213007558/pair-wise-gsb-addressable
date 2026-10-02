@@ -701,6 +701,172 @@ describe Addressable::Template do
     end
   end
 
+  describe "extract_candidates" do
+    def candidates(pattern, uri, types, limit=nil)
+      Addressable::Template.new(pattern).extract_candidates(uri, types, limit)
+    end
+
+    it "returns scalar, list, and map values with their original classes" do
+      scalar = candidates("{var}", "abc", :var => :scalar)
+      list = candidates("{/list*}", "/a/b/c", :list => :list)
+      map = candidates("{?map*}", "?a=1&b=2", :map => :map)
+
+      expect(scalar.to_a).to eq([{"var" => "abc"}])
+      expect(list.to_a).to eq([{"list" => %w(a b c)}])
+      expect(map.to_a).to eq([{"map" => {"a" => "1", "b" => "2"}}])
+    end
+
+    it "covers RFC6570 operators for scalar, list, and map variables" do
+      patterns = [
+        ["{var}", {"var" => "a,b/x;y?z=#"}],
+        ["{+var}", {"var" => "a,b/x;y?z=#"}],
+        ["{#var}", {"var" => "a,b/x;y?z=#"}],
+        ["{.var}", {"var" => "abc"}],
+        ["{/var}", {"var" => "abc"}],
+        ["{;var}", {"var" => "abc"}],
+        ["{?var}", {"var" => "abc"}],
+        ["{&var}", {"var" => "abc"}]
+      ]
+      patterns.each do |pattern, mapping|
+        uri = Addressable::Template.new(pattern).expand(mapping).to_str
+        result = candidates(pattern, uri, :var => :scalar)
+        expect(result).to contain_exactly(mapping)
+      end
+
+      operators = {
+        nil => ["{list}", "{map}", "{list*}", "{map*}"],
+        "+" => ["{+list}", "{+map}", "{+list*}", "{+map*}"],
+        "#" => ["{#list}", "{#map}", "{#list*}", "{#map*}"],
+        "." => ["{.list}", "{.map}", "{.list*}", "{.map*}"],
+        "/" => ["{/list}", "{/map}", "{/list*}", "{/map*}"],
+        ";" => ["{;list}", "{;map}", "{;list*}", "{;map*}"],
+        "?" => ["{?list}", "{?map}", "{?list*}", "{?map*}"],
+        "&" => ["{&list}", "{&map}", "{&list*}", "{&map*}"]
+      }
+      operators.each do |_, patterns|
+        list_mapping = {"list" => ["a,b", "x/y", "k=v"]}
+        map_mapping = {"map" => {"a,b" => "x/y", "k=v" => "1;2"}}
+        patterns.each do |pattern|
+          variable = pattern.include?("list") ? "list" : "map"
+          mapping = pattern.include?("list") ? list_mapping : map_mapping
+          uri = Addressable::Template.new(pattern).expand(mapping).to_str
+          variable_type = pattern.include?('list') ? :list : :map
+          result = candidates(pattern, uri, variable => variable_type)
+          expect(result.candidates).to include(mapping)
+          result.candidates.each do |candidate|
+            expect(Addressable::Template.new(pattern).expand(candidate).to_str)
+              .to eq(uri)
+          end
+        end
+      end
+    end
+
+    it "returns both list and map candidates for the same non-exploded output" do
+      result = candidates("{var}", "a,b", :var => [:list, :map])
+      expect(result).to contain_exactly(
+        {"var" => %w(a b)},
+        {"var" => {"a" => "b"}}
+      )
+      expect(result).to be_ambiguous
+    end
+
+    it "returns both list and map candidates for the same query output" do
+      result = candidates("{?var}", "?var=a,b", :var => [:list, :map])
+      expect(result).to contain_exactly(
+        {"var" => %w(a b)},
+        {"var" => {"a" => "b"}}
+      )
+      expect(result).to be_ambiguous
+    end
+
+    it "does not split percent-encoded separators" do
+      result = candidates("{var}", "a%2Cb", :var => [:scalar, :list])
+      expect(result).to contain_exactly(
+        {"var" => "a,b"},
+        {"var" => ["a,b"]}
+      )
+      expect(result).to be_ambiguous
+
+      list = candidates("{/list*}", "/a%2Fb/c", :list => :list)
+      expect(list.to_a).to eq([{"list" => ["a/b", "c"]}])
+    end
+
+    it "reports ambiguity for adjacent variables without separators" do
+      result = candidates("{a}{b}", "xy", :a => :scalar, :b => :scalar)
+      expect(result).to contain_exactly(
+        {"a" => nil, "b" => "xy"},
+        {"a" => "", "b" => "xy"},
+        {"a" => "x", "b" => "y"},
+        {"a" => "xy", "b" => nil},
+        {"a" => "xy", "b" => ""}
+      )
+      expect(result).to be_ambiguous
+    end
+
+    it "reports unbounded prefix truncation ambiguity" do
+      result = candidates("{var:3}", "val", :var => :scalar)
+      expect(result.to_a).to eq([{"var" => "val"}])
+      expect(result).not_to be_complete
+      expect(result).to be_ambiguous
+      expect(result.ambiguities.first[:reason]).to eq(:prefix_truncation)
+    end
+
+    it "reports prefix ambiguity even for a shorter observed prefix" do
+      result = candidates("{var:3}", "va", :var => :scalar)
+      expect(result.candidates).to eq([{"var" => "va"}])
+      expect(result).not_to be_complete
+      expect(result).not_to be_no_solution
+    end
+
+    it "distinguishes empty strings from missing variables" do
+      result = candidates("{a,b}", "a,", :a => :scalar, :b => :scalar)
+      expect(result.to_a).to eq([{"a" => "a", "b" => ""}])
+      expect(result).not_to be_ambiguous
+
+      missing = candidates("{a,b}", "a", :a => :scalar, :b => :scalar)
+      expect(missing).to contain_exactly(
+        {"a" => "a", "b" => nil},
+        {"a" => nil, "b" => "a"}
+      )
+      expect(missing).to be_ambiguous
+    end
+
+    it "distinguishes empty query parameters from missing variables" do
+      empty = candidates("{?a}", "?a=", :a => :scalar)
+      expect(empty.to_a).to eq([{"a" => ""}])
+      expect(empty).not_to be_ambiguous
+
+      missing = candidates("{?a}", "", :a => :scalar)
+      expect(missing.to_a).to eq([{"a" => nil}])
+      expect(missing).not_to be_ambiguous
+    end
+
+    it "reports duplicate query keys as not representable as a map" do
+      result = candidates("{?map*}", "?a=1&a=2", :map => :map)
+      expect(result).to be_no_solution
+    end
+
+    it "separates no solution from truncated, incomplete enumeration" do
+      missing = candidates(
+        "x{a}{b}", "zz", {:a => :scalar, :b => :scalar}, 0
+      )
+      expect(missing).to be_no_solution
+      expect(missing).to be_complete
+
+      truncated = candidates(
+        "{a}{b}", "xy", {:a => :scalar, :b => :scalar}, 2
+      )
+      expect(truncated.size).to eq(2)
+      expect(truncated).to be_truncated
+      expect(truncated).not_to be_complete
+    end
+
+    it "decodes percent escapes only once" do
+      result = candidates("{var}", "a%252Cb", :var => :scalar)
+      expect(result.to_a).to eq([{"var" => "a%2Cb"}])
+    end
+  end
+
   describe "Partial expand with symbols" do
     context "partial_expand with two simple values" do
       subject {
