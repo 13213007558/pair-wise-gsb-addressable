@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+- adds Addressable::URI#shortest_route_from and
+  Addressable::URI#shortest_route_to, which return the shortest reference
+  (in UTF-8 bytes) that resolves to the normalized target when joined with
+  a base URI, considering empty, query-only, fragment-only, relative-path,
+  absolute-path, network-path, and absolute references
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)

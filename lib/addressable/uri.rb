@@ -2152,6 +2152,167 @@ module Addressable
     end
 
     ##
+    # Returns the shortest reference that resolves to this URI when joined
+    # with the supplied base URI. Unlike <code>route_from</code>, every
+    # reference form is considered, and the result is guaranteed to satisfy
+    # <code>base.join(result) == self.normalize</code>, where the comparison
+    # also treats an empty query (or fragment) as distinct from an absent
+    # one. Lengths are compared by the number of UTF-8 bytes in the final
+    # reference string.
+    #
+    # References are generated in the following fixed order, and ties
+    # between references of equal byte length are broken in favor of the
+    # earliest form in this list:
+    #
+    # 1. Empty-path references: the empty reference, a fragment-only
+    #    reference, or a query-only reference. Only usable when the target
+    #    path matches the base path.
+    # 2. Relative-path references (<code>../</code>-style, possibly with a
+    #    <code>./</code> prefix when the first segment would otherwise
+    #    contain a colon or the path would begin with two slashes).
+    # 3. Absolute-path references.
+    # 4. Network-path references (<code>//host/path</code>).
+    # 5. Absolute URIs (the scheme is retained).
+    #
+    # Path segments are compared in their percent-encoded form, so an
+    # encoded reserved character such as <code>%2F</code> is never treated
+    # as a path separator.
+    #
+    # @param [String, Addressable::URI, #to_str] uri The base URI.
+    #
+    # @return [Addressable::URI]
+    #   The shortest reference that resolves to this URI.
+    def shortest_route_from(uri)
+      base = URI.parse(uri)
+      if self.relative?
+        raise ArgumentError, "Expected absolute URI, got: #{self.to_s}"
+      end
+      if base.relative?
+        raise ArgumentError, "Expected absolute URI, got: #{uri.to_s}"
+      end
+
+      # A comparison key that, unlike ==, keeps an empty query or fragment
+      # distinct from an absent one after normalization.
+      strict_key = lambda do |candidate|
+        normalized = candidate.normalize
+        [
+          normalized.to_s,
+          candidate.query.nil? ? nil : (normalized.query || EMPTY_STR),
+          candidate.fragment.nil? ? nil : (normalized.fragment || EMPTY_STR)
+        ]
+      end
+
+      normalized_base = base.normalize
+      normalized_self = self.normalize
+      target_key = strict_key.call(self)
+
+      target_scheme = normalized_self.scheme
+      target_authority = normalized_self.authority
+      target_path = normalized_self.path || EMPTY_STR
+      target_query =
+        self.query.nil? ? nil : (normalized_self.query || EMPTY_STR)
+      target_fragment =
+        self.fragment.nil? ? nil : (normalized_self.fragment || EMPTY_STR)
+
+      base_scheme = normalized_base.scheme
+      base_authority = normalized_base.authority
+      base_path = normalized_base.path || EMPTY_STR
+
+      query_suffix = target_query.nil? ? EMPTY_STR : "?#{target_query}"
+      fragment_suffix =
+        target_fragment.nil? ? EMPTY_STR : "##{target_fragment}"
+
+      candidates = []
+
+      # Empty-path references resolve to the base path, so they are only
+      # usable when the paths already match.
+      if target_path == base_path
+        candidates << EMPTY_STR
+        candidates << fragment_suffix unless target_fragment.nil?
+        unless target_query.nil?
+          candidates << "?#{target_query}#{fragment_suffix}"
+        end
+      end
+
+      if target_scheme == base_scheme && target_authority == base_authority
+        # Mirror the base directory computation performed by join.
+        base_dir = base_path.include?(SLASH) ?
+          base_path.sub(/\/[^\/]+$/, SLASH) : EMPTY_STR
+        base_dir = SLASH if base_dir.empty? && base_authority != nil
+        if base_dir.start_with?(SLASH) && target_path.start_with?(SLASH)
+          base_segments = base_dir.split(SLASH, -1)
+          base_segments.shift
+          base_segments.pop
+          target_segments = target_path.split(SLASH, -1)
+          target_segments.shift
+          common = 0
+          while common < base_segments.length &&
+              common < target_segments.length &&
+              base_segments[common] == target_segments[common]
+            common += 1
+          end
+          # A run of parent segments cannot address the final segment of
+          # the target, so step back and re-add that segment explicitly.
+          if common == target_segments.length && common > 0
+            common -= 1
+          end
+          up = base_segments.length - common
+          down = target_segments[common..-1]
+          if down == [EMPTY_STR]
+            # A trailing ".." or "." resolves to the same directory as
+            # "../" or "./", but is one byte shorter.
+            relative = up == 0 ? SELF_REF : ([PARENT] * up).join(SLASH)
+          else
+            relative = ([PARENT] * up + down).join(SLASH)
+          end
+          if relative.start_with?(SLASH) ||
+              relative[/\A[^\/]*/].include?(":")
+            # A leading "//" would be read as a network-path reference and
+            # a colon in the first segment would be read as a scheme.
+            relative = "./#{relative}"
+          end
+          candidates << "#{relative}#{query_suffix}#{fragment_suffix}"
+        end
+        if target_path.start_with?(SLASH)
+          candidates << "#{target_path}#{query_suffix}#{fragment_suffix}"
+        end
+      end
+
+      if target_scheme == base_scheme && target_authority != nil
+        candidates <<
+          "//#{target_authority}#{target_path}" +
+          "#{query_suffix}#{fragment_suffix}"
+      end
+
+      absolute = +"#{target_scheme}:"
+      absolute << "//#{target_authority}" if target_authority != nil
+      absolute << target_path
+      absolute << query_suffix << fragment_suffix
+      candidates << absolute
+
+      best = nil
+      candidates.each do |candidate|
+        next if best && candidate.bytesize >= best.bytesize
+        next unless strict_key.call(base.join(candidate)) == target_key
+        best = candidate
+      end
+      return URI.parse(best)
+    end
+
+    ##
+    # Returns the shortest reference to the supplied URI that resolves
+    # against this URI as a base. This is effectively the opposite of
+    # <code>shortest_route_from</code>.
+    #
+    # @param [String, Addressable::URI, #to_str] uri The URI to route to.
+    #
+    # @return [Addressable::URI]
+    #   The shortest reference that resolves to the supplied URI.
+    def shortest_route_to(uri)
+      return URI.parse(uri).shortest_route_from(self)
+    end
+
+    ##
     # Returns a normalized URI object.
     #
     # NOTE: This method does not attempt to fully conform to specifications.

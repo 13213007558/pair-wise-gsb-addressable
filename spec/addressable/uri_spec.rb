@@ -6852,3 +6852,212 @@ describe Addressable::URI, "YAML safe loading" do
     expect(YAML.dump(url)).to_not include("!ruby/object {}")
   end
 end
+
+describe Addressable::URI, "shortest route" do
+  # Unlike ==, this treats an empty query or fragment as distinct from an
+  # absent one.
+  def strict_resolve_equal?(base, reference, target)
+    joined = base.join(reference)
+    joined.normalize.to_s == target.normalize.to_s &&
+      joined.query.nil? == target.query.nil? &&
+      joined.fragment.nil? == target.fragment.nil?
+  end
+
+  def shortest(target, base)
+    Addressable::URI.parse(target).shortest_route_from(base)
+  end
+
+  it "should return an Addressable::URI" do
+    expect(shortest("http://h/a", "http://h/")).to be_kind_of(Addressable::URI)
+  end
+
+  it "should find the empty reference when base and target match" do
+    expect(shortest("http://h/a?q#f", "http://h/a?q#f").to_s).to eq("")
+  end
+
+  it "should find a fragment-only reference" do
+    expect(shortest("http://h/a#f", "http://h/a").to_s).to eq("#f")
+  end
+
+  it "should find a query-only reference" do
+    expect(shortest("http://h/a?q=1", "http://h/a").to_s).to eq("?q=1")
+  end
+
+  it "should find a relative-path reference" do
+    expect(shortest("http://h/a/c", "http://h/a/b").to_s).to eq("c")
+    expect(shortest("http://h/aaaa/x", "http://h/aaaa/b/c").to_s).to eq("../x")
+  end
+
+  it "should find an absolute-path reference when it is shorter" do
+    expect(shortest("http://h/x", "http://h/a/b/c/d").to_s).to eq("/x")
+  end
+
+  it "should find a network-path reference when authorities differ" do
+    expect(shortest("http://h2/a", "http://h1/").to_s).to eq("//h2/a")
+  end
+
+  it "should find an absolute URI when schemes differ" do
+    expect(shortest("https://h/a", "http://h/").to_s).to eq("https://h/a")
+  end
+
+  it "should handle a base without a path" do
+    expect(shortest("http://example.com/a", "http://example.com").to_s).to eq("a")
+    expect(shortest("http://example.com", "http://example.com").to_s).to eq("")
+  end
+
+  it "should distinguish an empty query from an inherited query" do
+    expect(shortest("http://h/a?", "http://h/a?x=1").to_s).to eq("?")
+    expect(shortest("http://h/a?", "http://h/a").to_s).to eq("?")
+    expect(shortest("http://h/a", "http://h/a?x=1").to_s).to eq("a")
+    expect(shortest("http://h/a", "http://h/a?q").to_s).to_not eq("")
+  end
+
+  it "should not mistake a colon in the first segment for a scheme" do
+    expect(shortest("http://h/a/c:d", "http://h/a/b").to_s).to eq("./c:d")
+  end
+
+  it "should not mistake a leading // for a network-path reference" do
+    expect(shortest("http://h//b", "http://h/a").to_s).to eq(".//b")
+    expect(shortest("http://h//c", "http://h/a/b").to_s).to eq("..//c")
+  end
+
+  it "should not treat percent-encoded slashes as path separators" do
+    result = shortest("http://h/a%2Fb/c", "http://h/x")
+    expect(result.to_s).to eq("a%2Fb/c")
+    expect(
+      Addressable::URI.parse("http://h/x").join(result).normalize.to_s
+    ).to eq("http://h/a%2Fb/c")
+  end
+
+  it "should normalize percent-encoded dots before routing" do
+    expect(shortest("http://h/a/%2e%2e/b", "http://h/a/c").to_s).to eq("/b")
+    expect(shortest("http://h/a%2eb", "http://h/c").to_s).to eq("a.b")
+    expect(shortest("http://h/a%2e/b", "http://h/x").to_s).to eq("a./b")
+  end
+
+  it "should break ties using the documented reference order" do
+    # Both "../b" and "/a/b" are four bytes long; the relative-path
+    # reference comes first in the documented order.
+    expect(shortest("http://h/a/b", "http://h/a/x/").to_s).to eq("../b")
+  end
+
+  it "should route to the parent directory with '.'" do
+    expect(shortest("http://h/a/", "http://h/a/b").to_s).to eq(".")
+    expect(shortest("http://h/a/", "http://h/a/b/c").to_s).to eq("..")
+  end
+
+  it "should re-add the final segment when parent segments cannot address it" do
+    expect(shortest("http://h/aaaaaaaaaa/b", "http://h/aaaaaaaaaa/b/c").to_s).to eq("../b")
+  end
+
+  it "should resolve back to the normalized target through join" do
+    [
+      ["http://h/a/b?x=1#f", "http://h/c"],
+      ["http://h/a?", "http://h/a?y"],
+      ["http://h//a//b", "http://h/"],
+      ["http://h/a%2Fb", "http://h/a%2Fb/c"],
+      ["http://user:pass@h/a", "http://user:pass@h/b"],
+      ["http://h:8080/a", "http://h/a"]
+    ].each do |target, base|
+      result = shortest(target, base)
+      expect(
+        strict_resolve_equal?(
+          Addressable::URI.parse(base), result.to_s,
+          Addressable::URI.parse(target)
+        )
+      ).to eq(true), "expected #{result.to_s.inspect} to resolve to #{target}"
+    end
+  end
+
+  it "should raise an ArgumentError for a relative URI" do
+    expect do
+      Addressable::URI.parse("/a/b").shortest_route_from("http://h/")
+    end.to raise_error(ArgumentError)
+  end
+
+  it "should raise an ArgumentError for a relative base" do
+    expect do
+      Addressable::URI.parse("http://h/a").shortest_route_from("/a/b")
+    end.to raise_error(ArgumentError)
+  end
+
+  it "should be the inverse of shortest_route_to" do
+    base = Addressable::URI.parse("http://h/a/b?x=1")
+    target = Addressable::URI.parse("http://h/c/d?#f")
+    expect(base.shortest_route_to(target)).to eq(
+      target.shortest_route_from(base)
+    )
+  end
+
+  it "should be optimal for exhaustively enumerated short references" do
+    bases = [
+      "http://h",
+      "http://h/",
+      "http://h/a",
+      "http://h/a/b",
+      "http://h/a/b?x=1"
+    ]
+    target_paths = [
+      "/", "/a", "/b", "/a/b", "/a/", "/a//b", "//a",
+      "/a%2Fb", "/%2e/a", "/a/%2e%2e/b", "/a:b", "/b/c"
+    ]
+    target_queries = [nil, ""]
+    references = [""]
+    characters = ["a", "b", "c", "/", ".", "?", "#", ":"]
+    (1..3).each do |length|
+      characters.repeated_permutation(length) do |permutation|
+        references << permutation.join
+      end
+    end
+    path_characters = ["a", "b", "/", "."]
+    (1..4).each do |length|
+      path_characters.repeated_permutation(length) do |permutation|
+        references << permutation.join
+      end
+    end
+    encoded_tokens = [
+      "a", "b", "c", "/", ".", "..", "%2e", "%2E", "%2f", "%2F", "?", "#"
+    ]
+    (1..3).each do |length|
+      encoded_tokens.repeated_permutation(length) do |permutation|
+        references << permutation.join
+      end
+    end
+    references.uniq!
+    bases.each do |base_string|
+      base = Addressable::URI.parse(base_string)
+      target_paths.each do |path|
+        target_queries.each do |query|
+          target_string = "http://h#{path}"
+          target_string += "?#{query}" unless query.nil?
+          target = Addressable::URI.parse(target_string)
+          result = target.shortest_route_from(base)
+          expect(
+            strict_resolve_equal?(base, result.to_s, target)
+          ).to eq(true), "expected #{result.to_s.inspect} to resolve to " +
+            "#{target_string} from #{base_string}"
+          candidates = references + [target_string]
+          unless target.authority.nil?
+            network_path = "//#{target.authority}#{target.path}"
+            network_path += "?#{target.query}" unless target.query.nil?
+            candidates << network_path
+          end
+          shorter = candidates.select do |reference|
+            reference.bytesize < result.to_s.bytesize
+          end
+          valid_shorter = shorter.select do |reference|
+            begin
+              strict_resolve_equal?(base, reference, target)
+            rescue Addressable::URI::InvalidURIError
+              false
+            end
+          end
+          expect(valid_shorter).to eq([]),
+            "expected no reference shorter than #{result.to_s.inspect} " +
+            "for #{target_string} from #{base_string}, " +
+            "got: #{valid_shorter.inspect}"
+        end
+      end
+    end
+  end
+end
