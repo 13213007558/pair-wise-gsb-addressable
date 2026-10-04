@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+- added a pure-Ruby UTS #46 (Unicode IDNA Compatibility Processing)
+  implementation, pinned to Unicode 15.1.0, with configurable
+  transitional/nontransitional processing, STD3 ASCII rules and
+  per-label error reporting (`Addressable::IDNA::UTS46`)
+- `Addressable::IDNA.to_ascii` and `Addressable::IDNA.to_unicode`
+  accept an optional UTS #46 configuration; `Addressable::URI`
+  normalization can opt into it via `Addressable::URI.idna_config`
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)

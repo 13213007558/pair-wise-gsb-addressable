@@ -24,3 +24,7 @@ rescue LoadError
   # implementation...
   require "addressable/idna/pure"
 end
+
+# UTS #46 support (pure Ruby, pinned Unicode data version); always
+# available regardless of which IDNA backend is in use.
+require "addressable/idna/uts46"

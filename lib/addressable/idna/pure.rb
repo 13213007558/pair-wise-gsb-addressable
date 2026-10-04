@@ -59,7 +59,17 @@ module Addressable
 
     # Converts from a Unicode internationalized domain name to an ASCII
     # domain name as described in RFC 3490.
-    def self.to_ascii(input)
+    #
+    # When a {Addressable::IDNA::UTS46::Config} is passed via the
+    # +config+ keyword, the UTS #46 processing pipeline is used
+    # instead of the legacy RFC 3490 behavior, and
+    # {Addressable::IDNA::UTS46::InvalidDomainError} is raised if the
+    # domain name fails validation.
+    def self.to_ascii(input, config: nil)
+      if config
+        require "addressable/idna/uts46"
+        return UTS46.to_ascii!(input, config: config)
+      end
       input = input.to_s unless input.is_a?(String)
       input = input.dup.force_encoding(Encoding::UTF_8).unicode_normalize(:nfkc)
       if input.respond_to?(:force_encoding)
@@ -85,7 +95,15 @@ module Addressable
 
     # Converts from an ASCII domain name to a Unicode internationalized
     # domain name as described in RFC 3490.
-    def self.to_unicode(input)
+    #
+    # When a {Addressable::IDNA::UTS46::Config} is passed via the
+    # +config+ keyword, the UTS #46 processing pipeline is used
+    # instead of the legacy RFC 3490 behavior.
+    def self.to_unicode(input, config: nil)
+      if config
+        require "addressable/idna/uts46"
+        return UTS46.to_unicode!(input, config: config)
+      end
       input = input.to_s unless input.is_a?(String)
       parts = input.split('.')
       parts.map! do |part|

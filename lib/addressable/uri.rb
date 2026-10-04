@@ -35,6 +35,32 @@ module Addressable
     end
 
     ##
+    # The IDNA configuration used when normalizing internationalized
+    # domain names in hosts. When +nil+ (the default), the legacy
+    # {Addressable::IDNA} conversion is used. Assign one of the
+    # predefined UTS #46 configurations
+    # ({Addressable::IDNA::UTS46::TRANSITIONAL} or
+    # {Addressable::IDNA::UTS46::NONTRANSITIONAL}) or a custom
+    # {Addressable::IDNA::UTS46::Config} to normalize hosts with the
+    # UTS #46 pipeline instead.
+    #
+    # @return [Addressable::IDNA::UTS46::Config, nil]
+    def self.idna_config
+      @idna_config
+    end
+
+    ##
+    # Sets the IDNA configuration used when normalizing hosts. See
+    # {.idna_config}.
+    def self.idna_config=(config)
+      if config && !defined?(::Addressable::IDNA::UTS46)
+        require "addressable/idna/uts46"
+      end
+      @idna_config = config
+    end
+    @idna_config = nil
+
+    ##
     # Container for the character classes specified in
     # <a href="http://www.ietf.org/rfc/rfc3986.txt">RFC 3986</a>.
     #
@@ -1128,9 +1154,23 @@ module Addressable
 
       @normalized_host ||= begin
         if !self.host.strip.empty?
-          result = ::Addressable::IDNA.to_ascii(
-            URI.unencode_component(self.host.strip.downcase)
-          )
+          unencoded_host = URI.unencode_component(self.host.strip.downcase)
+          if URI.idna_config && defined?(::Addressable::IDNA::UTS46)
+            uts46_result = ::Addressable::IDNA::UTS46.to_ascii(
+              unencoded_host, config: URI.idna_config
+            )
+            # Fall back to the legacy conversion when the host does
+            # not pass UTS #46 validation, so that normalization never
+            # fails.
+            result =
+              if uts46_result.success?
+                uts46_result.output
+              else
+                ::Addressable::IDNA.to_ascii(unencoded_host)
+              end
+          else
+            result = ::Addressable::IDNA.to_ascii(unencoded_host)
+          end
           if result =~ /[^\.]\.$/
             # Single trailing dots are unnecessary.
             result = result[0...-1]
@@ -2200,7 +2240,13 @@ module Addressable
     # @return [Addressable::URI] A URI suitable for display purposes.
     def display_uri
       display_uri = self.normalize
-      display_uri.host = ::Addressable::IDNA.to_unicode(display_uri.host)
+      if URI.idna_config && defined?(::Addressable::IDNA::UTS46)
+        display_uri.host = ::Addressable::IDNA::UTS46.to_unicode!(
+          display_uri.host, config: URI.idna_config
+        )
+      else
+        display_uri.host = ::Addressable::IDNA.to_unicode(display_uri.host)
+      end
       return display_uri
     end
 
