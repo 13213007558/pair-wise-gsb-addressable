@@ -48,6 +48,37 @@ uri.normalize
 #=> #<Addressable::URI:0xc9a4c8 URI:http://www.xn--8ws00zhy3a.com/>
 ```
 
+## UTS #46 IDNA profiles
+
+The pure-Ruby IDNA implementation bundles Unicode 15.1.0
+data and provides configurable UTS #46 profiles. The legacy
+`Addressable::IDNA.to_ascii` and `Addressable::IDNA.to_unicode` methods remain
+available for backwards compatibility.
+
+```ruby
+require "addressable/uri"
+
+nontransitional = Addressable::IDNA::Profile.new
+transitional = Addressable::IDNA::Profile.new(transitional: true)
+strict = Addressable::IDNA::STRICT_PROFILE
+
+nontransitional.to_ascii!("faß.de")
+#=> "xn--fa-hia.de"
+transitional.to_ascii!("faß.de")
+#=> "fass.de"
+Addressable::IDNA::DISPLAY_PROFILE.to_unicode!("xn--fa-hia.de")
+#=> "faß.de"
+
+result = strict.to_ascii("good.ex_ample.bad")
+result.success?
+#=> false
+result.errors_by_label
+#=> {1 => [:disallowed_std3]}
+
+Addressable::URI.parse("http://faß.de/").normalize(strict).to_s
+#=> "http://xn--fa-hia.de/"
+```
+
 
 ## URI Templates
 

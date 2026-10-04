@@ -22,5 +22,6 @@ begin
 rescue LoadError
   # libidn or the idn gem was not available, fall back on a pure-Ruby
   # implementation...
-  require "addressable/idna/pure"
+  load File.expand_path("idna/pure.rb", __dir__)
 end
+load File.expand_path("idna/uts46.rb", __dir__)

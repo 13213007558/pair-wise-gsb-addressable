@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add bundled Unicode 15.1.0 pure-Ruby UTS #46 profiles with
+  transitional/nontransitional, STD3, hyphen, Bidi, ContextJ, ContextO and
+  DNS length options, plus per-label error reporting.
+- Add explicit IDNA profile support to URI normalization and display.
+- Fix Punycode decoding of supplementary codepoints and numeric labels.
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)

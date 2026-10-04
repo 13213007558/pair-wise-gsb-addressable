@@ -4537,122 +4537,57 @@ module Addressable
     private_class_method :punycode_encode
 
     def self.punycode_decode(punycode)
-      input = []
+      punycode = punycode.to_s
+      input = punycode.codepoints.to_a
+      if input.any? { |codepoint| codepoint > 0x7F }
+        raise PunycodeBadInput, "Input is invalid."
+      end
+      if input.length > ACE_MAX_LENGTH * 2
+        raise PunycodeBigOutput, "Output would exceed the space provided."
+      end
+
       output = []
-
-      if ACE_MAX_LENGTH * 2 < punycode.size
-        raise PunycodeBigOutput, "Output would exceed the space provided."
-      end
-      punycode.each_byte do |c|
-        unless c >= 0 && c <= 127
-          raise PunycodeBadInput, "Input is invalid."
-        end
-        input.push(c)
+      delimiter = input.rindex(PUNYCODE_DELIMITER)
+      if delimiter
+        output.concat(input[0...delimiter])
+        input = input[(delimiter + 1)..-1] || []
       end
 
-      input_length = input.length
-      output_length = [UNICODE_MAX_LENGTH]
-
-      # Initialize the state
       n = PUNYCODE_INITIAL_N
-
-      out = i = 0
-      max_out = output_length[0]
       bias = PUNYCODE_INITIAL_BIAS
+      i = 0
 
-      # Handle the basic code points:  Let b be the number of input code
-      # points before the last delimiter, or 0 if there is none, then
-      # copy the first b code points to the output.
+      until input.empty?
+        old_i = i
+        weight = 1
+        k = PUNYCODE_BASE
 
-      b = 0
-      input_length.times do |j|
-        b = j if punycode_delimiter?(input[j])
-      end
-      if b > max_out
-        raise PunycodeBigOutput, "Output would exceed the space provided."
-      end
-
-      b.times do |j|
-        unless punycode_basic?(input[j])
-          raise PunycodeBadInput, "Input is invalid."
-        end
-        output[out] = input[j]
-        out+=1
-      end
-
-      # Main decoding loop:  Start just after the last delimiter if any
-      # basic code points were copied; start at the beginning otherwise.
-
-      in_ = b > 0 ? b + 1 : 0
-      while in_ < input_length
-
-        # in_ is the index of the next character to be consumed, and
-        # out is the number of code points in the output array.
-
-        # Decode a generalized variable-length integer into delta,
-        # which gets added to i.  The overflow checking is easier
-        # if we increase i as we go, then subtract off its starting
-        # value at the end to obtain delta.
-
-        oldi = i; w = 1; k = PUNYCODE_BASE
-        while true
-          if in_ >= input_length
-            raise PunycodeBadInput, "Input is invalid."
-          end
-          digit = punycode_decode_digit(input[in_])
-          in_+=1
-          if digit >= PUNYCODE_BASE
-            raise PunycodeBadInput, "Input is invalid."
-          end
-          if digit > (PUNYCODE_MAXINT - i) / w
-            raise PunycodeOverflow, "Input needs wider integers to process."
-          end
-          i += digit * w
-          t = (
-            if k <= bias
-              PUNYCODE_TMIN
-            elsif k >= bias + PUNYCODE_TMAX
-              PUNYCODE_TMAX
-            else
-              k - bias
-            end
-          )
+        loop do
+          raise PunycodeBadInput, "Input is invalid." if input.empty?
+          digit = punycode_decode_digit(input.shift)
+          raise PunycodeBadInput, "Input is invalid." if digit >= PUNYCODE_BASE
+          raise PunycodeOverflow if digit > (PUNYCODE_MAXINT - i) / weight
+          i += digit * weight
+          t = k - bias
+          t = PUNYCODE_TMIN if k <= bias
+          t = PUNYCODE_TMAX if k >= bias + PUNYCODE_TMAX
           break if digit < t
-          if w > PUNYCODE_MAXINT / (PUNYCODE_BASE - t)
-            raise PunycodeOverflow, "Input needs wider integers to process."
-          end
-          w *= PUNYCODE_BASE - t
+          raise PunycodeOverflow if weight > PUNYCODE_MAXINT / (PUNYCODE_BASE - t)
+          weight *= PUNYCODE_BASE - t
           k += PUNYCODE_BASE
         end
 
-        bias = punycode_adapt(i - oldi, out + 1, oldi == 0)
-
-        # I was supposed to wrap around from out + 1 to 0,
-        # incrementing n each time, so we'll fix that now:
-
-        if i / (out + 1) > PUNYCODE_MAXINT - n
-          raise PunycodeOverflow, "Input needs wider integers to process."
-        end
-        n += i / (out + 1)
-        i %= out + 1
-
-        # Insert n at position i of the output:
-
-        # not needed for Punycode:
-        # raise PUNYCODE_INVALID_INPUT if decode_digit(n) <= base
-        if out >= max_out
-          raise PunycodeBigOutput, "Output would exceed the space provided."
-        end
-
-        #memmove(output + i + 1, output + i, (out - i) * sizeof *output)
-        output[i + 1, out - i] = output[i, out - i]
-        output[i] = n
+        out = output.length + 1
+        bias = punycode_adapt(i - old_i, out, old_i == 0)
+        raise PunycodeOverflow if i / out > PUNYCODE_MAXINT - n
+        delta_n = i / out
+        i = i % out
+        raise PunycodeBigOutput if output.length >= UNICODE_MAX_LENGTH
+        raise PunycodeBadInput if n + delta_n > 0x10FFFF
+        n += delta_n
+        output.insert(i, n)
         i += 1
-
-        out += 1
       end
-
-      output_length[0] = out
 
       output.pack("U*")
     end
@@ -4677,14 +4612,11 @@ module Addressable
     # (for use in representing integers) in the range 0 to
     # base - 1, or PUNYCODE_BASE if codepoint does not represent a value.
     def self.punycode_decode_digit(codepoint)
-      if codepoint - 48 < 10
-        codepoint - 22
-      elsif codepoint - 65 < 26
-        codepoint - 65
-      elsif codepoint - 97 < 26
-        codepoint - 97
-      else
-        PUNYCODE_BASE
+      case codepoint
+      when 97..122 then codepoint - 97
+      when 65..90 then codepoint - 65
+      when 48..57 then codepoint - 22
+      else PUNYCODE_BASE
       end
     end
     private_class_method :punycode_decode_digit

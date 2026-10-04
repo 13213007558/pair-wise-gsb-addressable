@@ -147,6 +147,11 @@ shared_examples_for "converting from unicode to ASCII" do
     )).to eq("xn--2h8haa.ws")
   end
 
+  it "should decode labels containing astral characters and joiners" do
+    expect(Addressable::IDNA.to_unicode("xn--ab-fsf604u"))
+      .to eq("a\u094D\u200Cb")
+  end
+
   it "should handle two adjacent '.'s correctly" do
     expect(Addressable::IDNA.to_ascii(
       "example..host"
@@ -259,20 +264,24 @@ end
 
 describe Addressable::IDNA, "when using the pure-Ruby implementation" do
   before do
-    Addressable.send(:remove_const, :IDNA)
-    load "addressable/idna/pure.rb"
+    Addressable.send(:remove_const, :IDNA) if defined?(Addressable::IDNA)
+    load File.expand_path('../../../lib/addressable/idna/pure.rb', __FILE__)
   end
 
   it_should_behave_like "converting from unicode to ASCII"
   it_should_behave_like "converting from ASCII to unicode"
+  after do
+    Addressable.send(:remove_const, :IDNA) if defined?(Addressable::IDNA)
+    load File.expand_path('../../../lib/addressable/idna.rb', __FILE__)
+  end
 
   begin
     require "fiber"
 
     it "should not blow up inside fibers" do
       f = Fiber.new do
-        Addressable.send(:remove_const, :IDNA)
-        load "addressable/idna/pure.rb"
+        Addressable.send(:remove_const, :IDNA) if defined?(Addressable::IDNA)
+        load File.expand_path('../../../lib/addressable/idna/pure.rb', __FILE__)
       end
       f.resume
     end
@@ -287,12 +296,16 @@ begin
 
   describe Addressable::IDNA, "when using the native-code implementation" do
     before do
-      Addressable.send(:remove_const, :IDNA)
-      load "addressable/idna/native.rb"
+      Addressable.send(:remove_const, :IDNA) if defined?(Addressable::IDNA)
+      load File.expand_path('../../../lib/addressable/idna/native.rb', __FILE__)
     end
 
     it_should_behave_like "converting from unicode to ASCII"
     it_should_behave_like "converting from ASCII to unicode"
+    after do
+      Addressable.send(:remove_const, :IDNA) if defined?(Addressable::IDNA)
+      load File.expand_path('../../../lib/addressable/idna.rb', __FILE__)
+    end
   end
 rescue LoadError => error
   raise error if ENV["CI"] && TestHelper.native_supported?

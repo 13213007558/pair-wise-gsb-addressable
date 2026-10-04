@@ -1123,31 +1123,34 @@ module Addressable
     # The host component for this URI, normalized.
     #
     # @return [String] The host component, normalized.
-    def normalized_host
+    def normalized_host(idna_profile = :legacy)
       return nil unless self.host
 
-      @normalized_host ||= begin
-        if !self.host.strip.empty?
-          result = ::Addressable::IDNA.to_ascii(
-            URI.unencode_component(self.host.strip.downcase)
-          )
-          if result =~ /[^\.]\.$/
-            # Single trailing dots are unnecessary.
-            result = result[0...-1]
-          end
-          result = Addressable::URI.normalize_component(
-            result,
-            NormalizeCharacterClasses::HOST
-          )
-          result
-        else
-          EMPTY_STR.dup
-        end
-      end
-      # All normalized values should be UTF-8
-      force_utf8_encoding_if_needed(@normalized_host)
-      @normalized_host
+      @normalized_hosts ||= {}
+      @normalized_hosts[idna_profile] ||= idna_profile == :legacy ?
+        normalize_host_with(->(host) { ::Addressable::IDNA.to_ascii(host) }) :
+        normalize_host_with(->(host) { idna_profile.to_ascii!(host) })
     end
+
+    private
+
+    def normalize_host_with(idna_profile)
+      if self.host.strip.empty?
+        EMPTY_STR.dup
+      else
+        result = idna_profile.call(URI.unencode_component(self.host.strip.downcase))
+        if result =~ /[^\.]\.$/
+          result = result[0...-1]
+        end
+        result = Addressable::URI.normalize_component(
+          result, NormalizeCharacterClasses::HOST
+        )
+        force_utf8_encoding_if_needed(result)
+        result
+      end
+    end
+
+    public
 
     ##
     # Sets the host component for this URI.
@@ -1162,6 +1165,7 @@ module Addressable
       # Reset dependent values
       @authority = nil
       @normalized_host = nil
+      @normalized_hosts = nil
       remove_composite_values
 
       # Ensure we haven't created an invalid URI
@@ -2161,24 +2165,39 @@ module Addressable
     # cached multiple times.
     #
     # @return [Addressable::URI] The normalized URI.
-    def normalize
+    def normalize(idna_profile = nil)
       # This is a special exception for the frequently misused feed
       # URI scheme.
       if normalized_scheme == "feed"
         if self.to_s =~ /^feed:\/*http:\/*/
           return URI.parse(
             self.to_s[/^feed:\/*(http:\/*.*)/, 1]
-          ).normalize
+          ).normalize(idna_profile)
         end
       end
 
-      return self.class.new(
+      authority = if idna_profile && self.authority
+        normalized = String.new
+        if normalized_userinfo
+          normalized << "#{normalized_userinfo}@"
+        end
+        normalized << normalized_host(idna_profile)
+        if normalized_port
+          normalized << ":#{normalized_port}"
+        end
+        normalized
+      else
+        normalized_authority
+      end
+
+      normalized_uri = self.class.new(
         :scheme => normalized_scheme,
-        :authority => normalized_authority,
+        :authority => authority,
         :path => normalized_path,
         :query => normalized_query,
         :fragment => normalized_fragment
       )
+      normalized_uri
     end
 
     ##
@@ -2187,8 +2206,8 @@ module Addressable
     # @return [Addressable::URI] The normalized URI.
     #
     # @see Addressable::URI#normalize
-    def normalize!
-      replace_self(self.normalize)
+    def normalize!(idna_profile = nil)
+      replace_self(self.normalize(idna_profile))
     end
 
     ##
@@ -2198,9 +2217,11 @@ module Addressable
     # section 7.6 for more information.
     #
     # @return [Addressable::URI] A URI suitable for display purposes.
-    def display_uri
-      display_uri = self.normalize
-      display_uri.host = ::Addressable::IDNA.to_unicode(display_uri.host)
+    def display_uri(idna_profile = nil)
+      display_uri = self.normalize(idna_profile)
+      display_uri.host = idna_profile ?
+        idna_profile.to_unicode!(display_uri.host) :
+        ::Addressable::IDNA.to_unicode(display_uri.host)
       return display_uri
     end
 
@@ -2586,6 +2607,7 @@ module Addressable
       @normalized_password = NONE
       @host = nil
       @normalized_host = nil
+      @normalized_hosts = nil
       @normalized_port = NONE
       @path = EMPTY_STR
       @normalized_path = nil
