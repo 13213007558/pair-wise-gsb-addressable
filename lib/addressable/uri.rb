@@ -2598,5 +2598,7 @@ module Addressable
     NONE = Module.new.freeze
 
     private_constant :NONE
+
+    require "addressable/uri/base_solver"
   end
 end

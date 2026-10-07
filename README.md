@@ -49,6 +49,30 @@ uri.normalize
 ```
 
 
+### Finding a base URI from relative references
+
+`Addressable::URI.solve_base` performs the inverse of relative resolution
+(RFC 3986 Section 5): given `relative reference => resolved URI` pairs, it
+finds a base URI that explains all of them. Fragment-only and query-only
+references participate in the constraints, every candidate is re-checked
+with the real resolver, and the result distinguishes a unique solution, a
+free solution family, and an unsatisfiable set of conflicting pairs.
+
+```ruby
+solution = Addressable::URI.solve_base(
+  "a/b" => "http://example.com/x/a/b",
+  "a/c" => "http://example.com/x/a/c"
+)
+solution.status    #=> :family
+solution.base.to_s #=> "http://example.com/x/"
+solution.free      #=> [:path, :query, :fragment]
+
+Addressable::URI.solve_base(
+  "a" => "http://h1/a", "b" => "http://h2/b"
+).status #=> :no_solution
+```
+
+
 ## URI Templates
 
 For more details, see [RFC 6570](https://www.rfc-editor.org/rfc/rfc6570.txt).
