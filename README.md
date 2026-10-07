@@ -48,6 +48,38 @@ uri.normalize
 #=> #<Addressable::URI:0xc9a4c8 URI:http://www.xn--8ws00zhy3a.com/>
 ```
 
+## Internationalized domain names (UTS 46)
+
+By default, {Addressable::IDNA} converts internationalized domain names
+with its historic IDNA2003-compatible behavior. An optional UTS 46
+(Unicode IDNA Compatibility Processing) mode is available for
+interoperating with clients that use UTS 46. It is pure Ruby, uses
+bundled Unicode 15.1.0 data (nothing is downloaded at runtime), and
+does not require libidn.
+
+```ruby
+require "addressable/idna"
+
+Addressable::IDNA.to_ascii("faß.de", mode: :uts46)
+#=> "xn--fa-hia.de"
+Addressable::IDNA.to_ascii("faß.de", mode: :uts46, transitional: true)
+#=> "fass.de"
+Addressable::IDNA.to_unicode("xn--fa-hia.de", mode: :uts46)
+#=> "faß.de"
+```
+
+{Addressable::IDNA::UTS46} can also be used directly, with options for
+transitional/nontransitional processing, STD3 ASCII rules, and label
+length, Bidi, ContextJ and ContextO checks:
+
+```ruby
+require "addressable/idna/uts46"
+
+Addressable::IDNA::UTS46.to_ascii("exa_mple.com", use_std3_ascii_rules: true)
+#=> Addressable::IDNA::UTS46::Error: the offending label and the rule
+#   that was violated are available as #label and #rule.
+```
+
 
 ## URI Templates
 

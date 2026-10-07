@@ -24,3 +24,55 @@ rescue LoadError
   # implementation...
   require "addressable/idna/pure"
 end
+
+module Addressable
+  module IDNA
+    class << self
+      # The legacy (IDNA2003-compatible) conversions, kept as the
+      # default. See Addressable::IDNA::UTS46 for the UTS 46 mode.
+      alias_method :to_ascii_idna2003, :to_ascii
+      alias_method :to_unicode_idna2003, :to_unicode
+      private :to_ascii_idna2003, :to_unicode_idna2003
+    end
+
+    ##
+    # Converts a Unicode domain name to ASCII.
+    #
+    # With the default +:idna2003+ mode this behaves exactly as it
+    # always has. With +mode: :uts46+ the domain name is processed
+    # according to Unicode IDNA Compatibility Processing (UTS #46)
+    # using bundled Unicode 15.1.0 data; see
+    # {Addressable::IDNA::UTS46.to_ascii} for the supported options.
+    def self.to_ascii(input, mode: :idna2003, **options)
+      case mode
+      when :idna2003
+        to_ascii_idna2003(input)
+      when :uts46
+        require "addressable/idna/uts46"
+        UTS46.to_ascii(input, **options)
+      else
+        raise ArgumentError, "unknown IDNA mode: #{mode.inspect}"
+      end
+    end
+
+    ##
+    # Converts an ASCII domain name to Unicode.
+    #
+    # With the default +:idna2003+ mode this behaves exactly as it
+    # always has. With +mode: :uts46+ the domain name is processed
+    # according to Unicode IDNA Compatibility Processing (UTS #46)
+    # using bundled Unicode 15.1.0 data; see
+    # {Addressable::IDNA::UTS46.to_unicode} for the supported options.
+    def self.to_unicode(input, mode: :idna2003, **options)
+      case mode
+      when :idna2003
+        to_unicode_idna2003(input)
+      when :uts46
+        require "addressable/idna/uts46"
+        UTS46.to_unicode(input, **options)
+      else
+        raise ArgumentError, "unknown IDNA mode: #{mode.inspect}"
+      end
+    end
+  end
+end

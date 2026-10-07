@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+- added optional UTS 46 mode to Addressable::IDNA ("mode: :uts46"), a
+  pure-Ruby implementation of Unicode IDNA Compatibility Processing
+  pinned to Unicode 15.1.0 data (bundled with the gem; no runtime
+  downloads and no libidn dependency), with transitional and
+  nontransitional processing, STD3 ASCII rules, and label length, Bidi
+  and ContextJ/ContextO checks. Conversion errors identify the
+  offending label and rule. The legacy IDNA2003-compatible mode is
+  unchanged and remains the default.
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)
