@@ -24,3 +24,43 @@ rescue LoadError
   # implementation...
   require "addressable/idna/pure"
 end
+
+require "addressable/idna/uts46"
+
+module Addressable
+  module IDNA
+    class << self
+      alias_method :to_ascii_without_mode, :to_ascii
+      alias_method :to_unicode_without_mode, :to_unicode
+
+      # Converts a Unicode internationalized domain name to ASCII.
+      #
+      # @param [String] input The domain name to convert.
+      # @param [Symbol] mode The IDNA mode: :idna2003 (the default,
+      #   historical behavior) or :uts46 (UTS #46, Unicode IDNA
+      #   Compatibility Processing, pinned to Unicode
+      #   UTS46::UNICODE_VERSION).
+      # @param [Hash] options When mode is :uts46, options are passed
+      #   to UTS46.to_ascii (transitional:, use_std3_rules:,
+      #   check_bidi:, check_joiners:, check_hyphens:,
+      #   verify_dns_length:).
+      def to_ascii(input, mode: :idna2003, **options)
+        if mode == :uts46
+          UTS46.to_ascii(input, **options)
+        else
+          to_ascii_without_mode(input)
+        end
+      end
+
+      # Converts an ASCII domain name to Unicode. See #to_ascii for the
+      # mode and options parameters.
+      def to_unicode(input, mode: :idna2003, **options)
+        if mode == :uts46
+          UTS46.to_unicode(input, **options)
+        else
+          to_unicode_without_mode(input)
+        end
+      end
+    end
+  end
+end
